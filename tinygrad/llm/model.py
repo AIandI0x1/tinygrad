@@ -563,7 +563,7 @@ class Transformer:
     if getenv("NV_PQ2_GEMV"):
       # repack the biggest lazy PQ2 weights first, bounded by NV_PQ2_GEMV_GB: the card is ~12GB
       # and repacked tensors + the rest of the model must fit; untagged weights stay lazy-dequant
-      tag_budget = int(getenv("NV_PQ2_GEMV_GB", 4) * (1 << 30))
+      tag_budget = int(getenv("NV_PQ2_GEMV_GB", 3) * (1 << 30))
       candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
                            if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')), reverse=True)
       for nbytes, k, v in candidates:
