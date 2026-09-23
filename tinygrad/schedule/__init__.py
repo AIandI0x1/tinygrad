@@ -152,7 +152,14 @@ pm_schedule = PatternMatcher([
 
 def assert_all_same_devices(ast:UOp):
   devices = dedup([x.device for x in ast.toposort() if x.op is Ops.PARAM and x.device is not None])
-  if len(devices) >= 2: raise RuntimeError(f"all buffers must be on the same device: {devices}")
+  if len(devices) >= 2:
+    import inspect
+    for frm in inspect.stack():
+      if 'llm' in frm.filename or 'model.py' in frm.filename: print("   caller:", frm.filename, frm.lineno, frm.code_context)
+    print("AST:", str(ast)[:400])
+    for x in ast.toposort():
+      if x.op is Ops.PARAM and x.device is not None: print("  PARAM", x.device, str(x.arg)[:80])
+    raise RuntimeError(f"all buffers must be on the same device: {devices}")
 
 def copy_kernel_to_store(call:UOp, dst:UOp, src:UOp, r:UOp|None=None):
   if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
