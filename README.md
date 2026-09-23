@@ -5,7 +5,7 @@
   <img alt="tiny corp logo" src="/docs/logo_tiny_dark.svg" width="50%" height="50%">
 </picture>
 
-tiny3060: tinygrad fork optimized for the RTX 3060 eGPU path (hcq2 remote PCI). Based on [tinygrad](https://github.com/tinygrad/tinygrad) — for something between [PyTorch](https://github.com/pytorch/pytorch) and [karpathy/micrograd](https://github.com/karpathy/micrograd). Maintained by [tiny corp](https://tinygrad.org).
+tiny3060: tinygrad fork optimized for the RTX 3060 eGPU path (hcq2 remote PCI). Based on [tinygrad](https://github.com/tinygrad/tinygrad) — for something between [PyTorch](https://github.com/pytorch/pytorch) and [karpathy/micrograd](https://github.com/karpathy/micrograd). 
 
 <h3>
 
