@@ -429,10 +429,14 @@ class RemotePCIDevice(PCIDevice):
   def _rpc(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b'',
            readout_size:int=0) -> tuple[int, int, bytes]:
     if DEBUG >= 2: print(f"  remote rpc {cmd.name} {dev=} {bar=} {args=} {readout_size=}", flush=True)
-    RemotePCIDevice._post(sock, cmd, *args, dev=dev, bar=bar, payload=payload)
-    status, r0, r1 = struct.unpack(REMOTE_RESP, RemotePCIDevice._recvall(sock, struct.calcsize(REMOTE_RESP)))
-    if status: raise RuntimeError(f"remote {cmd.name} failed: {RemotePCIDevice._recvall(sock, r0).decode()}")
-    return r0, r1, RemotePCIDevice._recvall(sock, readout_size)
+    try:
+      RemotePCIDevice._post(sock, cmd, *args, dev=dev, bar=bar, payload=payload)
+      status, r0, r1 = struct.unpack(REMOTE_RESP, RemotePCIDevice._recvall(sock, struct.calcsize(REMOTE_RESP)))
+      if status: raise RuntimeError(f"remote {cmd.name} failed: {RemotePCIDevice._recvall(sock, r0).decode()}")
+      return r0, r1, RemotePCIDevice._recvall(sock, readout_size)
+    except (TimeoutError, socket.timeout) as e:
+      raise RuntimeError(f"remote {cmd.name} timed out: the device stopped answering - "
+                         "it is wedged (replug the eGPU or run `python3 extra/nv_remote_reset.py`)") from e
 
   def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
     self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, int(pcibus.split(':')[-1]), None
@@ -482,6 +486,8 @@ class APLRemotePCIDevice(RemotePCIDevice):
           subprocess.Popen([APLRemotePCIDevice.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.05)
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    # bound every RPC: a wedged device stops answering and must error, not hang the process
+    sock.settimeout(getenv("APL_RPC_TIMEOUT", 120))
     return sock
 
   def __init__(self, devpref:str, pcibus:str):

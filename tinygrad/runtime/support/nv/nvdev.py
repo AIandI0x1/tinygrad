@@ -112,7 +112,12 @@ class NVDev:
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
-    self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
+    try:
+      self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
+    except KeyError as e:
+      # a wedged GPU answers register reads with garbage (e.g. arch=0x3f) - name the cause, not the symptom
+      raise RuntimeError(f"NV_PMC_BOOT_42 reports architecture {self.chip_details['architecture']:#x} (chip_id {self.chip_id:#x}): "
+                         "the GPU is wedged - replug the eGPU or run `python3 extra/nv_remote_reset.py`") from e
     self.fw_name = {"GB2": "gb202", "AD1": "ad102", "GA1": "ga102"}[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 

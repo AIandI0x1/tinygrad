@@ -33,6 +33,19 @@ def kill_server():
     try: os.kill(int(line.split()[0]), signal.SIGTERM)
     except OSError: pass
 
+def dext_spin() -> tuple[int|None, float]:
+  """A wedged dext burns ~100% CPU polling dead registers. Returns (pid, cpu%)."""
+  out = subprocess.run(["pgrep", "-fl", "tinygpu.driver2"], capture_output=True, text=True).stdout
+  worst, wp = 0.0, None
+  for line in out.splitlines():
+    try: pid = int(line.split()[0])
+    except (ValueError, IndexError): continue
+    top = subprocess.run(["ps", "-o", "%cpu=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    try: cpu = float(top)
+    except ValueError: continue
+    if cpu > worst: worst, wp = cpu, pid
+  return wp, worst
+
 def probe(timeout_s=5.0) -> bool:
   """True if the device answers a PROBE/CFG_READ within the timeout."""
   sock_path = _server_sock_path()
@@ -54,6 +67,11 @@ def main():
   if probe():
     print("device answers - soft wedge cleared, DEV=NV should work")
     return 0
+  dpid, dcpu = dext_spin()
+  if dpid is not None and dcpu > 50.0:
+    print(f"dext {dpid} is spinning at {dcpu:.0f}% CPU - the device is wedged below the driver; "
+          "killing processes won't help. Replug the eGPU (or reload the dext with admin).")
+    return 1
   # server may not be running yet; try a fresh init in a subprocess (init polls
   # dead registers without a timeout, so it must not hang this script)
   print("no answer from server - attempting fresh init to respawn it...")

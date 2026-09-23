@@ -139,6 +139,11 @@ class FallbackTemplate:
 from tinygrad.llm.serve import LLMServer
 
 def main():
+  # SIGINT sets a flag instead of raising: in-flight GPU work drains, then we exit between
+  # operations so the device can finalize cleanly (killing mid-command-buffer wedges remote GPUs)
+  stop = {"flag": False}
+  import signal
+  signal.signal(signal.SIGINT, lambda sig, frame: stop.__setitem__("flag", True))
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
@@ -184,6 +189,7 @@ def main():
   if args.benchmark is not None:
     gen = model.generate(toks:=[tok.bos_id or 0])
     for i in range(args.benchmark):
+      if stop["flag"]: break
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()
       if (log:=getenv("BENCHMARK_LOG", "")): from extra.bench_log import WallTimeEvent, BenchEvent
