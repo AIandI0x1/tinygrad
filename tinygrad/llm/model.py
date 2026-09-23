@@ -1,10 +1,10 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
-from typing import Any
+from typing import Any, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear_raw, pq2_forward
+from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear_raw, tag_pq2_expert_raw, pq2_forward
 from tinygrad.llm.gguf import gguf_load, dequant_blocks
 from tinygrad.uop.ops import Ops, resolve
 
@@ -50,13 +50,26 @@ class HadamardLinear(Linear):
     if (out := pq2_forward(self, x)) is not None: return out
     return x.linear(self.weight.transpose(), self.bias)
 
+class _PackedBox:
+  """slots-only holder: state-dict traversal only follows __dict__ objects and list/tuple/dict."""
+  __slots__ = ('t',)
+  def __init__(self, t:Tensor): self.t = t
+
 class HadamardEmbedding(nn.Embedding):
   """Embedding whose rows are stored in the rotated basis: apply the inverse transform (rot then signs)
-  to each looked-up row instead of materializing the full primal table."""
+  to each looked-up row instead of materializing the full primal table.
+  If _packed is set (raw PQ2_0 blocks, one row per token id), the lookup gathers + dequantizes just the
+  needed rows - the dense table is never materialized, saving ~2.2GB VRAM on Bonsai.
+  _packed is a _PackedBox so state-dict traversal doesn't see it as a parameter."""
+  _packed: _PackedBox|None = None
   def __init__(self, emb:nn.Embedding, spec:_HadamardSpec):
     self.weight, self._spec = emb.weight, spec
   def __call__(self, tokens:Tensor) -> Tensor:
-    x, n = super().__call__(tokens), self._spec.rot.shape[0]
+    if self._packed is not None:
+      x = dequant_blocks(self._packed.t[tokens].reshape(*tokens.shape, -1, 34), 142, cast(int, tokens.numel()), self.weight.shape[1])
+      x = x.reshape(*tokens.shape, self.weight.shape[1])
+    else: x = super().__call__(tokens)
+    n = self._spec.rot.shape[0]
     assert self._spec.signs is not None
     return ((x.reshape(*x.shape[:-1], -1, n) @ self._spec.rot).reshape(x.shape) * self._spec.signs).contiguous()
 
@@ -66,6 +79,9 @@ class ExpertWeights:
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    if getattr(self, '_pq2_raw3', None) is not None and isinstance(sel.numel(), int):
+      from tinygrad.llm.kernels.nv import pq2_gemv_moe
+      return pq2_gemv_moe(self, sel, x)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
@@ -530,6 +546,9 @@ class Transformer:
         if name == 'token_embd.weight':
           assert isinstance(model.token_embd, nn.Embedding)
           model.token_embd = HadamardEmbedding(model.token_embd, _HadamardSpec(rot, sign_map[config.dim]))
+          # decode gathers a single row/token - keep the table packed and dequantize on lookup
+          if getenv("NV_PQ2_GEMV") and name in raw_sd and not isinstance(raw_sd[name], Tensor):
+            model.token_embd._packed = _PackedBox(raw_sd[name][0].reshape(model.token_embd.weight.shape[0], -1).to('NV').realize())
         elif name in state_dict:
           e, d = state_dict[name].contiguous().realize(), int(state_dict[name].shape[-1])
           state_dict[name] = ((e.reshape(*e.shape[:-1], d//bs, bs) @ rot).reshape(e.shape) * sign_map[d]).contiguous().realize()
@@ -564,6 +583,7 @@ class Transformer:
     # the kernel reads packed 34B blocks directly (aligned u16 scale + assembled u32 codes)
     # so a tagged weight costs only its raw upload - but the 12GB card can't hold all of them
     # plus KV/embeddings/workspace. NV_PQ2_VRAM_GB caps the device counter, not the tag bytes.
+    pq2_params: set[int] = set()
     if getenv("NV_PQ2_GEMV"):
       from tinygrad.device import GlobalCounters
       cap = int(getenv("NV_PQ2_VRAM_GB", 10.9) * (1 << 30))
@@ -575,17 +595,26 @@ class Transformer:
                            if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')),
                           key=lambda c: (c[1] != 'output.weight', c[0]))
       for nbytes, k, v in candidates:
-        if GlobalCounters.mem_used_per_device.get('NV', 0) + nbytes > cap: continue
         obj = model
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         except (AttributeError, IndexError, TypeError): continue
-        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER:
-          try: tag_pq2_linear_raw(obj, v[0], name=k)
-          except MemoryError: pass
+        if not hasattr(obj, 'weight') or obj.weight.uop.base.op is Ops.BUFFER: continue
+        pq2_params.add(id(obj.weight))
+        if GlobalCounters.mem_used_per_device.get('NV', 0) + nbytes > cap: continue
+        try:
+          if isinstance(obj, Linear): tag_pq2_linear_raw(obj, v[0], name=k)
+          elif isinstance(obj, ExpertWeights): tag_pq2_expert_raw(obj, v[0], name=k)
+        except MemoryError: pass
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
+      packed_embd = getattr(model.token_embd, '_packed', None)
+      for s in (params:=nn.state.get_parameters(model)):
+        if packed_embd is not None and s is model.token_embd.weight: continue  # stays lazy, only packed rows are read
+        # untagged PQ2 weights stay lazy too: dense-realizing them costs ~7.5x the packed bytes and
+        # the fused-dequant kernel reads the resident packed buffer just as fast
+        if id(s) in pq2_params: continue
+        s.replace(s.contiguous())
       Tensor.realize(*params)
     return model, kv
 

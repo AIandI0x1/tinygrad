@@ -1,7 +1,7 @@
 # ******** quant linear: NV PQ2 gemv kernels over packed ggml weights ********
 
 import functools
-from typing import Callable
+from typing import Callable, Any, cast
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, getenv, DEBUG
@@ -138,12 +138,69 @@ def pq2_gemv_raw(layer:'Linear', x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer._pq2_raw, x, fxn=fxn)[0].reshape(out_shape)
   return result if layer.bias is None else result + layer.bias
 
-def tag_pq2_linear_raw(lin:'Linear', raw:Tensor, name:str="") -> None:
+def _nv_pq2_gemv_moe_kernel(out:UOp, codes:UOp, sel:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int,
+                            tokens:int, k:int, x_per:bool, shuffle_fmt:str) -> UOp:
+  # MoE variant: one warp per (token*expert-slot, output row). sel[token] picks the expert's
+  # packed rows; x is indexed per (b,t,k) or shared per (b,t) when the router broadcast it.
+  nb = in_features // 128
+  assert nb * 128 == in_features and (nb * 34) % 4 == 0, f"in_features {in_features} gives unaligned row"
+  nwords, rowb32 = nb * 8, nb * 34 // 4
+  n_exp = codes.shape[0]
+  codes, x = codes.reshape((n_exp, out_features, rowb32)), x.reshape((tokens if x_per else tokens // k, in_features))
+  token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
+  lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
+  e, xi = sel[token].load(), (token if x_per else token // k)
+  acc = UOp.const(0, dtypes.float32)
+  per = nwords // WARP_SIZE
+  for i in range(per):
+    wi = i*WARP_SIZE + lane
+    b, wsub = wi // 8, wi % 8
+    su32 = codes[e, out_row, (34*b) >> 2].load()
+    scale = ((su32 >> (8*(34*b & 3))) & 0xFFFF).cast(dtypes.uint16).bitcast(dtypes.float16).float()
+    off, w32 = 34*b + 2 + 4*wsub, (34*b + 2 + 4*wsub) >> 2
+    rem = off & 3
+    w0 = codes[e, out_row, w32].load()
+    w1 = codes[e, out_row, w32 + 1].load()
+    word = rem.eq(0).where(w0, (w0 >> (8*rem)) | (w1 << (8*(4-rem))))
+    inner = UOp.const(0, dtypes.float32)
+    base = b*128 + wsub*16
+    for j in range(16):
+      code = (word >> (j*2)) & 0x3
+      xv = x[xi, base+j].load()
+      inner = inner + (code.cast(dtypes.float32) - 1) * (xv.cast(dtypes.float32) if xv.dtype != dtypes.float32 else xv)
+    acc = acc + scale * inner
+  total = nv_warp_reduce(acc, shuffle_fmt)
+  return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="pq2_gemv_moe", opts_to_apply=()))
+
+def pq2_gemv_moe(ew:Any, sel:Tensor, x:Tensor) -> Tensor:
+  B, T, k = sel.shape
+  in_f, out_f = ew._pq2_in, ew._pq2_out
+  shared = x.shape[2] == 1
+  xs = x.contiguous().reshape(B*T if shared else B*T*k, in_f)
+  out = Tensor.empty(B*T*k, out_f, dtype=dtypes.float32, device=x.device)
+  fxn:Callable = functools.partial(_nv_pq2_gemv_moe_kernel, in_features=in_f, out_features=out_f,
+                                   tokens=cast(int, B*T*k), k=cast(int, k), x_per=not shared, shuffle_fmt=_shuffle_fmt(x.device))
+  return Tensor.custom_kernel(out, ew._pq2_raw3, sel.contiguous().reshape(-1), xs, fxn=fxn)[0].reshape(B, T, k, out_f)
+
+def tag_pq2_expert_raw(ew:Any, raw:Tensor, name:str="") -> None:
+  """Tag a lazy PQ2_0 ExpertWeights to run the expert-indexed gemv on packed 34B-block rows."""
+  E, out_f, in_f = ew.weight.shape
+  nb = in_f // 128
+  if in_f % 128 or (nb * 34) % 4 or (nb * 8) % WARP_SIZE: return
+  ew._pq2_E, ew._pq2_in, ew._pq2_out = E, in_f, out_f
+  ew._pq2_raw3 = raw.reshape(E * out_f, nb * 34).to(ew.weight.device).contiguous().bitcast(dtypes.uint32).realize()
+  if nv_custom_kernels_supported(ew.weight.device):
+    ew.weight = Tensor.zeros(1, dtype=dtypes.float16, device=ew.weight.device)
+
+def tag_pq2_linear_raw(lin:'Linear', raw:Tensor, name:str="", dest:str|None=None) -> None:
   """Tag a lazy PQ2_0 linear to run the fused gemv directly on its packed 34B-block buffer:
-  uploads the raw bytes to the device once (u32 view) and drops the lazy weight - no repack."""
+  uploads the raw bytes once (u32 view) and drops the lazy weight - no repack.
+  dest='CPU:APL' keeps the packed data in GPU-mapped sysmem instead of VRAM - slower per byte
+  over the link, but it still beats the fused lazy-dequant kernel and frees VRAM."""
   nb = lin.in_features // 128
   if lin.in_features % 128 or (nb * 34) % 4 or (nb * 8) % WARP_SIZE: return
-  lin._pq2_raw = raw.reshape(lin.out_features, nb * 34).to(lin.weight.device).contiguous().bitcast(dtypes.uint32).realize()
+  dest = dest or lin.weight.device
+  lin._pq2_raw = raw.reshape(lin.out_features, nb * 34).to(dest).contiguous().bitcast(dtypes.uint32).realize()
   lin.ggml_type = PQ2_0
   if nv_custom_kernels_supported(lin.weight.device):
     lin.weight = Tensor.zeros(1, dtype=dtypes.float16, device=lin.weight.device)
