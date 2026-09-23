@@ -351,7 +351,11 @@ class PCIIfaceBase:
       if not self.dev_impl.mm.va_base <= lo < lo + size <= self.dev_impl.mm.va_base + (1 << self.dev_impl.mm.va_bits):
         raise RuntimeError(f"Host address {lo:#x} is outside the GPU virtual address range")
       if self.remote is None: System.lock_memory(lo, size)
-      paddrs = [(x, 0x1000) for x in (b.meta if self.remote is not None else System.system_paddrs(lo, size))]
+      if self.remote is not None:
+        # remote sysmem slabs are page-granular and may cover more than nbytes - map the whole alloc
+        paddrs = [(x, 0x1000) for x in b.meta]
+        size = sum(p[1] for p in paddrs)
+      else: paddrs = [(x, 0x1000) for x in System.system_paddrs(lo, size)]
       aspace, snooped, uncached = AddrSpace.SYS, True, True
     elif isinstance(ifa:=getattr(Device[b.device], "iface", None), PCIIfaceBase):
       if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")

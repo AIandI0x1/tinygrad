@@ -66,7 +66,7 @@ class HadamardEmbedding(nn.Embedding):
     self.weight, self._spec = emb.weight, spec
   def __call__(self, tokens:Tensor) -> Tensor:
     if self._packed is not None:
-      x = dequant_blocks(self._packed.t[tokens].reshape(*tokens.shape, -1, 34), 142, cast(int, tokens.numel()), self.weight.shape[1])
+      x = dequant_blocks(self._packed.t[tokens].reshape(*tokens.shape, -1, 34), 142, cast(int, tokens.numel()), cast(int, self.weight.shape[1]))
       x = x.reshape(*tokens.shape, self.weight.shape[1])
     else: x = super().__call__(tokens)
     n = self._spec.rot.shape[0]
@@ -140,6 +140,7 @@ class TransformerConfig:
   expert_bias: bool = False
 
 class FFNBlock:
+  _dev: str|None = None  # heterogeneous offload: device this block computes on
   def __init__(self, config:TransformerConfig):
     self.config = config
 
@@ -429,7 +430,14 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    # heterogeneous split: a block's _dev runs it (and its KV/state) on another local device -
+    # only the (T, D) activation crosses device boundaries, once per block
+    for block in self.blk:
+      if (d := getattr(block, '_dev', None)) is not None:
+        # remote NV has no host-write path for VRAM, so hops back to NV bounce through
+        # GPU-mapped sysmem (CPU:APL); hops to local devices go direct
+        x = x.to('CPU:APL', force=True).to(d, force=True) if d == Device.DEFAULT and x.device != 'CPU:APL' else x.to(d, force=True)
+      x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
@@ -569,6 +577,26 @@ class Transformer:
         setattr(parent, parts[-1], HadamardLinear(obj, _HadamardSpec(rot, sign_map[obj.in_features], perm)))
 
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # heterogeneous split: LLM_OFFLOAD=METAL:30 puts blocks 30+ (weights, KV, state) on METAL.
+    # offloaded blocks skip NV tagging entirely and their activations cross once per block boundary
+    if (offload := getenv("LLM_OFFLOAD", "")):
+      odev, ostart_str = offload.split(':')
+      ostart = int(ostart_str)
+      for i, blk in enumerate(model.blk):
+        blk._dev = odev if i >= ostart else Device.DEFAULT
+        if i >= ostart:
+          # hadamard specs share rot/sign tensors across blocks - clone them onto the target FIRST so
+          # the param move below leaves the NV blocks' shared copies alone
+          def _fix_specs(o:Any, seen:set):
+            if id(o) in seen: return
+            seen.add(id(o))
+            if isinstance(o, HadamardLinear):
+              o._spec = _HadamardSpec(o._spec.rot.to(odev).realize(),
+                                      o._spec.signs.to(odev).realize() if o._spec.signs is not None else None, o._spec.perm)
+            for v in (vars(o).values() if hasattr(o, '__dict__') else
+                      o if isinstance(o, (list, tuple)) else ()): _fix_specs(v, seen)
+          _fix_specs(blk, set())
+          for p in nn.state.get_parameters(blk): p.replace(p.to(odev))
     # realize the largest still-lazy (packed dequant) weights dense while they fit the budget:
     # fused dequant in the matmul inner loop is the top decode cost on the remote NV path
     dense_budget = int(getenv("PQ2_DENSE_GB", 3) * 1e9)
@@ -599,13 +627,15 @@ class Transformer:
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         except (AttributeError, IndexError, TypeError): continue
+        parts = k[:-len('.weight')].split('.')
+        if parts[0] == 'blk' and getattr(model.blk[int(parts[1])], '_dev', Device.DEFAULT) != Device.DEFAULT: continue  # offloaded block
         if not hasattr(obj, 'weight') or obj.weight.uop.base.op is Ops.BUFFER: continue
         pq2_params.add(id(obj.weight))
         if GlobalCounters.mem_used_per_device.get('NV', 0) + nbytes > cap: continue
         try:
           if isinstance(obj, Linear): tag_pq2_linear_raw(obj, v[0], name=k)
           elif isinstance(obj, ExpertWeights): tag_pq2_expert_raw(obj, v[0], name=k)
-        except MemoryError: pass
+        except (MemoryError, RuntimeError): pass
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       packed_embd = getattr(model.token_embd, '_packed', None)

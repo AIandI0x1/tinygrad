@@ -199,7 +199,7 @@ def tag_pq2_linear_raw(lin:'Linear', raw:Tensor, name:str="", dest:str|None=None
   over the link, but it still beats the fused lazy-dequant kernel and frees VRAM."""
   nb = lin.in_features // 128
   if lin.in_features % 128 or (nb * 34) % 4 or (nb * 8) % WARP_SIZE: return
-  dest = dest or lin.weight.device
+  dest = dest or cast(str, lin.weight.device)
   lin._pq2_raw = raw.reshape(lin.out_features, nb * 34).to(dest).contiguous().bitcast(dtypes.uint32).realize()
   lin.ggml_type = PQ2_0
   if nv_custom_kernels_supported(lin.weight.device):
