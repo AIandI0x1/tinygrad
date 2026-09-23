@@ -70,13 +70,21 @@ def pq2_gemv(layer:'Linear', x:Tensor) -> Tensor:
 
 def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
   """Repack a PQ2_0 raw-block weight into aligned (scales u16, codes u32) tensors and tag
-  the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul."""
+  the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul.
+  The repack runs on the host: the 34-byte block layout puts code words at a 2-byte
+  offset, and realizing the bitcast view on-device emits misaligned u32 loads that
+  fault the remote GPU."""
   if lin.in_features % 128: return
+  import numpy as np
   nb = lin.in_features // 128
-  blocks = raw.reshape(lin.out_features, nb, 34)
-  lin._pq2_scales = blocks[:, :, :2].bitcast(dtypes.uint16).contiguous()
-  lin._pq2_codes = blocks[:, :, 2:].bitcast(dtypes.uint32).contiguous()
+  rn = raw.reshape(lin.out_features, nb, 34).numpy()
+  dev = lin.weight.device
+  lin._pq2_scales = Tensor(rn[:, :, :2].copy().view(np.uint16), device=dev)
+  lin._pq2_codes = Tensor(rn[:, :, 2:].copy().view('<u4'), device=dev)
   lin.ggml_type = PQ2_0
+  # the repack supersedes the packed storage; drop the lazy weight so its buffer frees
+  if nv_custom_kernels_supported(lin.weight.device):
+    lin.weight = Tensor.zeros(1, dtype=dtypes.float16, device=lin.weight.device)
 
 def pq2_forward(lin:'Linear', x:Tensor) -> Tensor|None:
   if getattr(lin, 'ggml_type', None) == PQ2_0 and nv_custom_kernels_supported(lin.weight.device):
