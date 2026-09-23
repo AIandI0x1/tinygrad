@@ -432,27 +432,21 @@ class Transformer:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     # heterogeneous split: a block's _dev runs it (and its KV/state) on another local device -
     # only the (T, D) activation crosses device boundaries, once per block
+    from tinygrad.device import canonicalize_device
+    def _hop(t:Tensor, d:str) -> Tensor:
+      # hop to device d via an explicit store so it lowers to a bulk copy exec item; materialize
+      # first so a view source doesn't become a strided cross-device kernel. Hops back to the
+      # default device bounce through GPU-mapped sysmem (remote NV has no host VRAM write path).
+      if t.device == (dc := cast(str, canonicalize_device(d))): return t
+      if dc == canonicalize_device(Device.DEFAULT) and t.device != canonicalize_device('CPU:APL'):
+        dst = t.uop.empty_like(device='CPU:APL')
+        t = Tensor(dst.after(dst.store(t.contiguous().uop)))
+      dst = t.uop.empty_like(device=dc)
+      return Tensor(dst.after(dst.store(t.contiguous().uop)))
     for block in self.blk:
-      if (d := getattr(block, '_dev', None)) is not None:
-        # a contiguous source lowers the hop to a bulk copy; METAL->NV has no host VRAM write
-        # path so it bounces through GPU-mapped sysmem (CPU:APL)
-        if x.device != d:
-          # materialize first: a view source would lower the hop to a strided kernel copy
-          # (cross-device INDEX) which the device assert rejects - contiguous gives a bulk copy
-          x = x.contiguous()
-          if d == Device.DEFAULT and x.device != 'CPU:APL':
-            dst = x.uop.empty_like(device='CPU:APL')
-            x = Tensor(dst.after(dst.store(x.uop)))   # bounce: NV->sysmem (GPU-mapped) first
-          dst = x.uop.empty_like(device=d)
-          x = Tensor(dst.after(dst.store(x.uop)))     # explicit store -> bulk copy exec item
+      if (d := getattr(block, '_dev', None)) is not None: x = _hop(x, d)
       x = block(x, start_pos)
-    # tail hop: output_norm/output always run on the default device
-    if x.device != Device.DEFAULT:
-      x = x.contiguous()
-      dst = x.uop.empty_like(device='CPU:APL')
-      x = Tensor(dst.after(dst.store(x.uop)))
-      dst = x.uop.empty_like(device=Device.DEFAULT)
-      x = Tensor(dst.after(dst.store(x.uop)))
+    x = _hop(x, Device.DEFAULT)  # output_norm/output run on the default device
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
