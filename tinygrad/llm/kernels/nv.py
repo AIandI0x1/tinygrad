@@ -6,7 +6,6 @@ from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
-from tinygrad.llm.gguf import dequant_blocks
 from tinygrad.llm.kernels.amd import Linear as AMDLinear
 
 PQ2_0 = 142
@@ -20,10 +19,10 @@ def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "NV": return False
   with Context(ALLOW_DEVICE_USAGE=1): return Device["NV"].device == "NV"
 
-def _shuffle_fmt(device:str|tuple[str, ...]) -> str:
+def _shuffle_fmt(device:str|tuple[str, ...]|None) -> str:
   if isinstance(device, tuple): device = device[0]
   # Metal shading language and CUDA both provide xor-shuffles with different names
-  return "simd_shuffle_xor({0}, %d)" if device.split(":")[0] == "METAL" else "__shfl_xor_sync(0xffffffffu, {0}, %d)"
+  return "simd_shuffle_xor({0}, %d)" if device is not None and device.split(":")[0] == "METAL" else "__shfl_xor_sync(0xffffffffu, {0}, %d)"
 
 def nv_warp_reduce(val:UOp, fmt:str, maximum:bool=False) -> UOp:
   for offset in (16, 8, 4, 2, 1):
@@ -69,30 +68,25 @@ def pq2_gemv(layer:'Linear', x:Tensor) -> Tensor:
   result = result.reshape(*x.shape[:-1], layer.out_features)
   return result if layer.bias is None else result + layer.bias
 
+def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
+  """Repack a PQ2_0 raw-block weight into aligned (scales u16, codes u32) tensors and tag
+  the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul."""
+  if lin.in_features % 128: return
+  nb = lin.in_features // 128
+  blocks = raw.reshape(lin.out_features, nb, 34)
+  lin._pq2_scales = blocks[:, :, :2].bitcast(dtypes.uint16).contiguous()
+  lin._pq2_codes = blocks[:, :, 2:].bitcast(dtypes.uint32).contiguous()
+  lin.ggml_type = PQ2_0
+
+def pq2_forward(lin:'Linear', x:Tensor) -> Tensor|None:
+  if getattr(lin, 'ggml_type', None) == PQ2_0 and nv_custom_kernels_supported(lin.weight.device):
+    return pq2_gemv(lin, x)
+  return None
+
 class Linear(AMDLinear):
   """AMD custom-kernel Linear extended with an NV PQ2_0 gemv path."""
   _pq2_scales: Tensor
   _pq2_codes: Tensor
-  def set_quantized(self, decoded:Tensor):
-    if self.ggml_type is not None or self.in_features % 128: return
-    graph = decoded.uop.toposort()
-    raw = next((u for u in graph if u.op is Ops.SHRINK and u.dtype == dtypes.uint8
-                and prod(u.shape) == self.out_features * (self.in_features // 128) * 34), None)
-    if raw is None: return super().set_quantized(decoded)
-    def unwrapped(u:UOp) -> UOp:
-      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
-        u = u.src[0]
-      return u
-    expected = dequant_blocks(Tensor(raw), PQ2_0, self.out_features, self.in_features)
-    if unwrapped(decoded.uop).key != unwrapped(expected.uop).key: return super().set_quantized(decoded)
-    nb = self.in_features // 128
-    blocks = Tensor(raw).reshape(self.out_features, nb, 34)
-    self._pq2_scales = blocks[:, :, :2].bitcast(dtypes.uint16).contiguous()
-    self._pq2_codes = blocks[:, :, 2:].bitcast(dtypes.uint32).contiguous()
-    self.ggml_type = PQ2_0
   def __call__(self, x:Tensor) -> Tensor:
-    if getattr(self, 'ggml_type', None) is None and nv_custom_kernels_supported(self.weight.device):
-      self.set_quantized(self.weight)
-    if getattr(self, 'ggml_type', None) == PQ2_0 and nv_custom_kernels_supported(self.weight.device):
-      return pq2_gemv(self, x)
+    if (out := pq2_forward(self, x)) is not None: return out
     return super().__call__(x)

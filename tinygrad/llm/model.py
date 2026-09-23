@@ -4,7 +4,7 @@ from typing import Any
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import Linear
+from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear, pq2_forward
 from tinygrad.llm.gguf import gguf_load, dequant_blocks
 from tinygrad.uop.ops import Ops, resolve
 
@@ -47,6 +47,7 @@ class HadamardLinear(Linear):
     if self._spec.signs is not None: x = x * self._spec.signs
     n = self._spec.rot.shape[0]
     x = (x.reshape(*x.shape[:-1], -1, n) @ self._spec.rot).reshape(x.shape)
+    if (out := pq2_forward(self, x)) is not None: return out
     return x.linear(self.weight.transpose(), self.bias)
 
 class HadamardEmbedding(nn.Embedding):
@@ -557,6 +558,15 @@ class Transformer:
       if p.nbytes() > dense_budget: break
       dense_budget -= p.nbytes()
       p.replace(p.contiguous().realize())
+    # tag the remaining lazy PQ2_0 linears for the NV fused gemv: repack raw blocks into
+    # aligned scale/code tensors (dense-realized weights keep their normal GEMM)
+    for k, v in raw_sd.items():
+      if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
+      obj = model
+      try:
+        for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+      except (AttributeError, IndexError, TypeError): continue
+      if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear(obj, v[0])
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
