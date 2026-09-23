@@ -558,12 +558,19 @@ class Transformer:
       if p.nbytes() > dense_budget: break
       dense_budget -= p.nbytes()
       p.replace(p.contiguous().realize())
-    # tag every lazy PQ2_0 linear for the NV fused gemv: the kernel reads the packed 34B
-    # blocks directly (aligned u16 scale + assembled u32 codes), so tagging needs no extra
-    # device memory over the packed buffer the lazy path already reads
+    # tag lazy PQ2_0 linears for the NV fused gemv, biggest first, until the device fills:
+    # the kernel reads packed 34B blocks directly (aligned u16 scale + assembled u32 codes)
+    # so a tagged weight costs only its raw upload - but the 12GB card can't hold all of them
+    # plus KV/embeddings/workspace. NV_PQ2_VRAM_GB caps the device counter, not the tag bytes.
     if getenv("NV_PQ2_GEMV"):
-      for k, v in raw_sd.items():
-        if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
+      from tinygrad.device import GlobalCounters
+      cap = int(getenv("NV_PQ2_VRAM_GB", 10.9) * (1 << 30))
+      # smallest first: whole lazy-kernel families (e.g. the 8.3MB gate/out weights, ~110ms/token
+      # of fused dequant) get covered for ~1GB, while big weights cost 23MB+ each for the same saving
+      candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
+                           if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')))
+      for nbytes, k, v in candidates:
+        if GlobalCounters.mem_used_per_device.get('NV', 0) + nbytes > cap: continue
         obj = model
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)

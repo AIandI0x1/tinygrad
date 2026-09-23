@@ -491,6 +491,11 @@ class Compiled:
       elif self.sleep_timeout_ms is not None and elapsed > self.sleep_timeout_ms / 1000: self.on_sleep()
 
   def synchronize(self, timeout:int|None=None):
+    # a remote submit batch defers the doorbell: it must reach the card before we start polling the timeline
+    with contextlib.suppress(ImportError):
+      from tinygrad.runtime.support.system import APLRemotePCIDevice
+      if APLRemotePCIDevice._flush_pending and APLRemotePCIDevice.instance is not None:
+        APLRemotePCIDevice.instance.flush_shadows(force=True)
     try:
       self._wait_signal(tl:=self.timeline.host.view(fmt='Q'), tl[1], timeout)
       for d, v in self.pending.items(): d._wait_signal(d.timeline.host.view(fmt='Q'), v, timeout)

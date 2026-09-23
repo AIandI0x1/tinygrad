@@ -494,6 +494,7 @@ class APLRemotePCIDevice(RemotePCIDevice):
     sock = self._server_sock(getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")))
     self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, 0, None
     self.peer_group, self.lock_fd = self.PEER_GROUP, System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+    APLRemotePCIDevice.instance = self
 
   # the server keeps sysmem in a fixed 128-slot table with no unmap command: carve small allocs out of large slabs
   _sysmem_slabs:ClassVar[list] = [] # [view, paddrs, bump_offset], shared by all instances on the single-client server
@@ -532,13 +533,23 @@ class APLRemotePCIDevice(RemotePCIDevice):
   # CPU-visible BAR writes can't be issued directly: host programs write into a local shadow page, which is then
   # diffed and forwarded to the real registers over MMIO_WRITE by flush_shadows() after each locally-run program.
   _shadows:ClassVar[list] = [] # shared by all instances on the single-client server
+  _defer_flush:int = 0    # when >0, flush_shadows only records a pending flush (see defer_remote_flush)
+  _flush_pending:bool = False
+  instance:'APLRemotePCIDevice|None' = None
 
   def shadow_mmio(self, bar:int, off:int, size:int, always_flush:bool=False) -> MMIOInterface:
     mm = mmap.mmap(-1, sz := round_up(size, mmap.PAGESIZE))
     self._shadows.append([memoryview(mm), bytearray(sz), bar, off, always_flush, -1]) # last written offset
     return MMIOInterface(mv_address(mm), sz, fmt='B')
 
-  def flush_shadows(self):
+  def flush_shadows(self, force:bool=False):
+    # during a deferred batch (defer_remote_flush) all submissions stay local; a single flush at the end
+    # writes the ring entries and strobes the doorbell once - saves a socket round-trip per submission.
+    # a GPU wait must force the flush first or the doorbell never reaches the card before polling.
+    if self._defer_flush and not force:
+      APLRemotePCIDevice._flush_pending = True
+      return
+    APLRemotePCIDevice._flush_pending = False
     # BAR1 (VRAM data: GPFIFO ring) must be flushed before BAR0 (doorbell) so the GPU sees the ring entry before being notified
     if DEBUG >= 3: print(f"  flush_shadows called, {len(self._shadows)} shadows", flush=True)
     for shadow in sorted(self._shadows, key=lambda s: -s[2]):
@@ -567,3 +578,15 @@ class APLRemotePCIDevice(RemotePCIDevice):
   def _bar(self, bar:int) -> tuple[int, int, int]: return (*self.rpc(RemoteCmd.MAP_BAR, bar=bar)[:2], 0)
   def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
     return RemoteMMIOInterface(self, bar, 0, size or (self._bar(bar)[1] - off), fmt, off=off)
+
+@contextlib.contextmanager
+def defer_remote_flush():
+  # batch all shadow flushes during the block into one: submissions keep writing the shadow
+  # pages locally and a single flush on exit delivers the ring entries + doorbell strobe.
+  # callers must not wait on GPU signals inside the block - the doorbell only fires on exit.
+  APLRemotePCIDevice._defer_flush += 1
+  try: yield
+  finally:
+    APLRemotePCIDevice._defer_flush -= 1
+    if APLRemotePCIDevice._defer_flush == 0 and APLRemotePCIDevice._flush_pending:
+      if APLRemotePCIDevice.instance is not None: APLRemotePCIDevice.instance.flush_shadows(force=True)

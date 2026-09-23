@@ -4,6 +4,7 @@ import decimal, array
 from dataclasses import dataclass, replace, field
 from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, prod, flatten, Context, to_tuple, tqdm, dedup
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
+from tinygrad.helpers import getenv
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite, ProgramInfo
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.renderer import Estimates, Renderer
@@ -150,7 +151,8 @@ def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
          and hasattr(dest.allocator, 'copy_from_disk') and src.nbytes >= 4096 and dest.allocator.supports_copy_from_disk:
       dest.allocator.copy_from_disk(dest._buf, src._buf, src.nbytes)
     elif dest.get_storage().host is not None and src.get_storage().host is not None:
-      for b in (dest, src): b.allocator.dev.synchronize()
+      if not getenv("NOSYNC_COPY"):
+        for b in (dest, src): b.allocator.dev.synchronize()
       with cpu_profile(f"{src.device} -> {dest.device}", f"{src.device}:COPY"): dest.host[:] = src.host[:]
     elif dest._host_mv() is not None: src.allocator._copyout(dest.as_memoryview(allow_zero_copy=True), src._buf)
     else: dest.allocator._copyin(dest._buf, src.as_memoryview(allow_zero_copy=True))

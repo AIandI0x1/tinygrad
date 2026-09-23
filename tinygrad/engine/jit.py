@@ -66,7 +66,8 @@ class CapturedJit(Generic[ReturnType]):
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
     concrete = tuple(_copy_input(u) if u in self._written_uops else u for u in input_uops)
     if DEBUG >= 1 and len(self.linear.src) >= 10: print(f"jit execs {len(self.linear.src)} calls")
-    run_linear(self.linear, var_vals, input_uops=concrete, jit=True)
+    from tinygrad.runtime.support.system import defer_remote_flush
+    with defer_remote_flush(): run_linear(self.linear, var_vals, input_uops=concrete, jit=True)
     return self.ret
 
   def free_intermediates(self):
