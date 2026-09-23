@@ -58,14 +58,13 @@ def _nv_pq2_gemv_kernel(out:UOp, codes:UOp, scales:UOp, x:UOp, *rest:UOp, in_fea
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="pq2_gemv", opts_to_apply=()))
 
 def pq2_gemv(layer:'Linear', x:Tensor) -> Tensor:
-  tokens = prod(x.shape[:-1])
+  out_shape, tokens = (*x.shape[:-1], layer.out_features), prod(x.shape[:-1])
   assert isinstance(tokens, int)
   x = x.contiguous().reshape(tokens, layer.in_features)
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn:Callable = functools.partial(_nv_pq2_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features,
                                    tokens=tokens, shuffle_fmt=_shuffle_fmt(x.device))
-  result = Tensor.custom_kernel(out, layer._pq2_codes, layer._pq2_scales, x, fxn=fxn)[0]
-  result = result.reshape(*x.shape[:-1], layer.out_features)
+  result = Tensor.custom_kernel(out, layer._pq2_codes, layer._pq2_scales, x, fxn=fxn)[0].reshape(out_shape)
   return result if layer.bias is None else result + layer.bias
 
 def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int, shuffle_fmt:str) -> UOp:
@@ -83,14 +82,13 @@ def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_f
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="f16_gemv", opts_to_apply=()))
 
 def f16_gemv(layer:AMDLinear, x:Tensor) -> Tensor:
-  tokens = prod(x.shape[:-1])
+  out_shape, tokens = (*x.shape[:-1], layer.out_features), prod(x.shape[:-1])
   assert isinstance(tokens, int)
   x = x.contiguous().reshape(tokens, layer.in_features)
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn:Callable = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features,
                                    tokens=tokens, shuffle_fmt=_shuffle_fmt(x.device))
-  result = Tensor.custom_kernel(out, layer.weight.reshape(-1), x, fxn=fxn)[0]
-  result = result.reshape(*x.shape[:-1], layer.out_features)
+  result = Tensor.custom_kernel(out, layer.weight.reshape(-1), x, fxn=fxn)[0].reshape(out_shape)
   return result if layer.bias is None else result + layer.bias
 
 def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
@@ -106,6 +104,9 @@ def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
   dev = lin.weight.device
   lin._pq2_scales = Tensor(rn[:, :, :2].copy().view(np.uint16), device=dev)
   lin._pq2_codes = Tensor(rn[:, :, 2:].copy().view('<u4'), device=dev)
+  # upload once: unrealized numpy-backed tensors would re-copy every jit call
+  lin._pq2_scales.realize()
+  lin._pq2_codes.realize()
   lin.ggml_type = PQ2_0
   # the repack supersedes the packed storage; drop the lazy weight so its buffer frees
   if nv_custom_kernels_supported(lin.weight.device):
