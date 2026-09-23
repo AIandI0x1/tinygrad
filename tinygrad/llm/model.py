@@ -567,11 +567,13 @@ class Transformer:
     if getenv("NV_PQ2_GEMV"):
       from tinygrad.device import GlobalCounters
       cap = int(getenv("NV_PQ2_VRAM_GB", 10.9) * (1 << 30))
-      # smallest first: whole lazy-kernel families (e.g. the 8.3MB gate/out weights, ~110ms/token
-      # of fused dequant) get covered for ~1GB, while big weights cost 23MB+ each for the same saving.
-      # upload transients inflate the counter, so also survive a hard OOM and keep going
+      # the LM head is the single hottest weight (full 337MB read every token) - tag it first,
+      # then smallest-first: whole lazy-kernel families get covered for ~1GB while big weights
+      # cost 23MB+ each for the same saving. upload transients inflate the counter, so also
+      # survive a hard OOM and keep going
       candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
-                           if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')))
+                           if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')),
+                          key=lambda c: (c[1] != 'output.weight', c[0]))
       for nbytes, k, v in candidates:
         if GlobalCounters.mem_used_per_device.get('NV', 0) + nbytes > cap: continue
         obj = model
