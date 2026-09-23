@@ -544,7 +544,9 @@ class APLRemotePCIDevice(RemotePCIDevice):
     for shadow in sorted(self._shadows, key=lambda s: -s[2]):
       mv, prev, bar, off, always, last_off = shadow
       cur = bytes(mv)
-      ch = [i for i in range(0, len(cur), 4) if cur[i:i + 4] != prev[i:i + 4]]
+      # find dirty 4KB pages with C-speed compares, then dword-diff only inside them (full dword diffs cost ~50ms/shadow)
+      pages = [p for p in range(0, len(cur), mmap.PAGESIZE) if cur[p:p + mmap.PAGESIZE] != prev[p:p + mmap.PAGESIZE]]
+      ch = [i for p in pages for i in range(p, min(p + mmap.PAGESIZE, len(cur)), 4) if cur[i:i + 4] != prev[i:i + 4]]
       if not ch and always and last_off >= 0: ch = [last_off] # strobe: re-send the last written dword (e.g. doorbell)
       if not ch: continue
       groups: list[list[int]] = []

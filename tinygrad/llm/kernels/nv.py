@@ -4,7 +4,7 @@ import functools
 from typing import Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, getenv
+from tinygrad.helpers import prod, getenv, DEBUG
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import Linear as AMDLinear
 
@@ -91,7 +91,7 @@ def f16_gemv(layer:AMDLinear, x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer.weight.reshape(-1), x, fxn=fxn)[0].reshape(out_shape)
   return result if layer.bias is None else result + layer.bias
 
-def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
+def tag_pq2_linear(lin:'Linear', raw:Tensor, name:str="") -> None:
   """Repack a PQ2_0 raw-block weight into aligned (scales u16, codes u32) tensors and tag
   the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul.
   The repack runs on the host: the 34-byte block layout puts code words at a 2-byte
@@ -105,6 +105,11 @@ def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
   lin._pq2_scales = Tensor(rn[:, :, :2].copy().view(np.uint16), device=dev)
   lin._pq2_codes = Tensor(rn[:, :, 2:].copy().view('<u4'), device=dev)
   # upload once: unrealized numpy-backed tensors would re-copy every jit call
+  if DEBUG >= 2:
+    from tinygrad.device import GlobalCounters
+    pd = {d: round(v / (1 << 20)) for d, v in GlobalCounters.mem_used_per_device.items()}
+    print(f"  tag_pq2 {name} {lin.out_features}x{lin.in_features}: scales {lin._pq2_scales.nbytes()>>20}MB "
+          f"codes {lin._pq2_codes.nbytes()>>20}MB per-device {pd}", flush=True)
   lin._pq2_scales.realize()
   lin._pq2_codes.realize()
   lin.ggml_type = PQ2_0

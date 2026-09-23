@@ -561,13 +561,20 @@ class Transformer:
     # tag the remaining lazy PQ2_0 linears for the NV fused gemv: repack raw blocks into
     # aligned scale/code tensors (dense-realized weights keep their normal GEMM)
     if getenv("NV_PQ2_GEMV"):
-      for k, v in raw_sd.items():
-        if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
+      # repack the biggest lazy PQ2 weights first, bounded by NV_PQ2_GEMV_GB: the card is ~12GB
+      # and repacked tensors + the rest of the model must fit; untagged weights stay lazy-dequant
+      tag_budget = int(getenv("NV_PQ2_GEMV_GB", 4) * (1 << 30))
+      candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
+                           if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')), reverse=True)
+      for nbytes, k, v in candidates:
+        if nbytes > tag_budget: continue
         obj = model
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         except (AttributeError, IndexError, TypeError): continue
-        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear(obj, v[0])
+        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER:
+          tag_pq2_linear(obj, v[0], name=k)
+          tag_budget -= nbytes
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
