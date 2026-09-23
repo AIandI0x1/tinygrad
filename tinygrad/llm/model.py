@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load, dequant_blocks
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import Ops, resolve
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -546,6 +546,16 @@ class Transformer:
         setattr(parent, parts[-1], HadamardLinear(obj, _HadamardSpec(rot, sign_map[obj.in_features], perm)))
 
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # realize the largest still-lazy (packed dequant) weights dense while they fit the budget:
+    # fused dequant in the matmul inner loop is the top decode cost on the remote NV path
+    dense_budget = int(getenv("PQ2_DENSE_GB", 3) * 1e9)
+    lazy = sorted((p for p in nn.state.get_parameters(model)
+                   if p.uop.base.op is not Ops.BUFFER and p is not model.token_embd.weight),
+                  key=lambda t: -t.nbytes())
+    for p in lazy:
+      if p.nbytes() > dense_budget: break
+      dense_budget -= p.nbytes()
+      p.replace(p.contiguous().realize())
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
