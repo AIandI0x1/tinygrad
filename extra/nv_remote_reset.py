@@ -54,16 +54,21 @@ def main():
   if probe():
     print("device answers - soft wedge cleared, DEV=NV should work")
     return 0
-  # server may not be running yet; force a spawn via the driver path
+  # server may not be running yet; try a fresh init in a subprocess (init polls
+  # dead registers without a timeout, so it must not hang this script)
   print("no answer from server - attempting fresh init to respawn it...")
+  env = dict(os.environ, DEV="NV")
   try:
-    from tinygrad import Tensor
-    print("probe init:", (Tensor.ones(2,2) @ Tensor.ones(2,2)).to("NV").numpy()[0,0])
-    print("device recovered")
-    return 0
-  except Exception as e:
-    print(f"hard wedge: {type(e).__name__}: {e}")
-    print("the GPU is not answering config reads - replug the eGPU (or reload the dext with admin)")
-    return 1
+    out = subprocess.run([sys.executable, "-c",
+      "from tinygrad import Tensor; print((Tensor.ones(4,4,device='NV')@Tensor.ones(4,4,device='NV')).numpy()[0,0])"],
+      capture_output=True, text=True, timeout=60, env=env)
+    if "4.0" in out.stdout:
+      print("device recovered")
+      return 0
+    print(f"hard wedge: {out.stderr.strip().splitlines()[-1] if out.stderr else 'no output'}")
+  except subprocess.TimeoutExpired:
+    print("hard wedge: init hung (60s timeout)")
+  print("the GPU is not answering config reads - replug the eGPU (or reload the dext with admin)")
+  return 1
 
 if __name__ == "__main__": sys.exit(main())
