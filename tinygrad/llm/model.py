@@ -560,13 +560,14 @@ class Transformer:
       p.replace(p.contiguous().realize())
     # tag the remaining lazy PQ2_0 linears for the NV fused gemv: repack raw blocks into
     # aligned scale/code tensors (dense-realized weights keep their normal GEMM)
-    for k, v in raw_sd.items():
-      if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
-      obj = model
-      try:
-        for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
-      except (AttributeError, IndexError, TypeError): continue
-      if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear(obj, v[0])
+    if getenv("NV_PQ2_GEMV"):
+      for k, v in raw_sd.items():
+        if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
+        obj = model
+        try:
+          for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+        except (AttributeError, IndexError, TypeError): continue
+        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear(obj, v[0])
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

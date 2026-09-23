@@ -68,6 +68,31 @@ def pq2_gemv(layer:'Linear', x:Tensor) -> Tensor:
   result = result.reshape(*x.shape[:-1], layer.out_features)
   return result if layer.bias is None else result + layer.bias
 
+def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int, shuffle_fmt:str) -> UOp:
+  # one warp per (token, output row): lanes stride the dense fp16 row
+  per = in_features // WARP_SIZE
+  assert per * WARP_SIZE == in_features, f"in_features {in_features} not divisible by warp size"
+  w, x = w.reshape((out_features, in_features)), x.reshape((tokens, in_features))
+  token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
+  lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(per):
+    e = i*WARP_SIZE + lane
+    acc = acc + w[out_row, e].load().float() * x[token, e].load().float()
+  total = nv_warp_reduce(acc, shuffle_fmt)
+  return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="f16_gemv", opts_to_apply=()))
+
+def f16_gemv(layer:AMDLinear, x:Tensor) -> Tensor:
+  tokens = prod(x.shape[:-1])
+  assert isinstance(tokens, int)
+  x = x.contiguous().reshape(tokens, layer.in_features)
+  out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
+  fxn:Callable = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features,
+                                   tokens=tokens, shuffle_fmt=_shuffle_fmt(x.device))
+  result = Tensor.custom_kernel(out, layer.weight.reshape(-1), x, fxn=fxn)[0]
+  result = result.reshape(*x.shape[:-1], layer.out_features)
+  return result if layer.bias is None else result + layer.bias
+
 def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
   """Repack a PQ2_0 raw-block weight into aligned (scales u16, codes u32) tensors and tag
   the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul.
@@ -86,15 +111,24 @@ def tag_pq2_linear(lin:'Linear', raw:Tensor) -> None:
   if nv_custom_kernels_supported(lin.weight.device):
     lin.weight = Tensor.zeros(1, dtype=dtypes.float16, device=lin.weight.device)
 
-def pq2_forward(lin:'Linear', x:Tensor) -> Tensor|None:
-  if getattr(lin, 'ggml_type', None) == PQ2_0 and nv_custom_kernels_supported(lin.weight.device):
-    return pq2_gemv(lin, x)
+def nv_forward(lin:'Linear', x:Tensor) -> Tensor|None:
+  """Dispatch decode matvecs to the custom NV kernels when the device supports them."""
+  if not nv_custom_kernels_supported(lin.weight.device): return None
+  if getattr(lin, 'ggml_type', None) == PQ2_0:
+    if isinstance(x.numel(), int): return pq2_gemv(lin, x)
+    return pq2_gemv(lin, x.pad_to(x.max_shape)).shrink(tuple((0, s) for s in (*x.shape[:-1], lin.out_features)))
+  if lin.in_features % WARP_SIZE: return None
+  w = lin.weight
+  if w.uop.base.op is Ops.BUFFER and w.dtype == dtypes.float16 and isinstance(x.numel(), int) and x.numel() == lin.in_features:
+    return f16_gemv(lin, x)
   return None
+
+pq2_forward = nv_forward # back-compat name
 
 class Linear(AMDLinear):
   """AMD custom-kernel Linear extended with an NV PQ2_0 gemv path."""
   _pq2_scales: Tensor
   _pq2_codes: Tensor
   def __call__(self, x:Tensor) -> Tensor:
-    if (out := pq2_forward(self, x)) is not None: return out
+    if (out := nv_forward(self, x)) is not None: return out
     return super().__call__(x)
