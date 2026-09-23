@@ -325,8 +325,13 @@ class HostAllocator(Allocator):
     self.dev.synchronize()
     with cpu_profile(f"{self.dev.device} -> TINY", f"{self.dev.device}:COPY"): dest[:] = self._view(src, dest.nbytes)[:]
   def _map(self, buf:Buffer) -> BufferStorage:
-    if Device[buf.device].host != self.dev.host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
-    return BufferStorage(buf.host.addr)
+    if Device[buf.device].host != self.dev.host and not getattr(getattr(self.dev, 'remote', None), 'exec_local', False):
+      raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+    # CPU-accessible buffers (sysmem or shadow MMIO): use the host view address
+    if (hs:=buf.get_storage().host) is not None: return BufferStorage(hs.addr)
+    # exec_local: VRAM buffers without CPU access — pass the GPU VA, it's only embedded in queue entries
+    if getattr(getattr(self.dev, 'remote', None), 'exec_local', False): return BufferStorage(buf._buf)
+    return BufferStorage(unwrap(buf.host).addr)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 class DepsTracker:
@@ -379,8 +384,14 @@ class Compiler:
     argv = f"{cmd} {pathlib.Path(__file__).parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    # pipes are unbuffered (bufsize=0): read/write can return short counts, so loop until the full payload moves
+    data = struct.pack("I", len(src.encode())) + src.encode()
+    while data: data = data[unwrap(proc.stdin).write(data):]
+    def read_exact(n:int) -> bytes:
+      ret = b''
+      while len(ret) < n and (chunk:=unwrap(proc.stdout).read(n - len(ret))): ret += chunk
+      return ret
+    if (lib:=read_exact(struct.unpack("I", read_exact(4))[0])): return lib
     raise CompileError("Compilation Error")
 
 

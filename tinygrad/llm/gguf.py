@@ -22,7 +22,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                10:(256,84), 11:(256,110), 12:(256,144), 13:(256,176), 14:(256,210),
                16:(256,66), 17:(256,74), 18:(256,98), 19:(256,50), 20:(32,18), 21:(256,110), 22:(256,82), 23:(256,136),
-               29:(256,56), 39:(32,17), 41:(128,18)}
+               29:(256,56), 39:(32,17), 41:(128,18), 142:(128,34)}
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -33,7 +33,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6),
   Q5_1 (id: 7), Q8_0 (id: 8), Q2_K (id: 10), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
   Q6_K (id: 14), IQ2_XXS (id: 16), IQ2_XS (id: 17), IQ3_XXS (id: 18), IQ1_S (id: 19),
-  IQ4_NL (id: 20), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41)
+  IQ4_NL (id: 20), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41), PQ2_0 (id: 142)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
@@ -180,7 +180,29 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       d = blocks[:,:2].bitcast(dtypes.float16)
       bits = q_to_uint8(blocks[:,2:], 1).reshape(-1, 8, 16).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
       return d * (bits * 2 - 1)
+    # PQ2_0: 128 elements per 34-byte block (fp16 scale + 32 bytes of 2-bit packed values), mapping {0,1,2,3} => {-1,0,+1,+2} * d
+    # element j lives in byte j//4 at bit offset (j%4)*2 (byte-major, LSB-first) - unlike q_to_uint8's interleaved layout
+    if ggml_type == 142:
+      d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      shift = Tensor.const(tuple(2**(i*2) for i in range(4)), blocks.dtype)
+      q = blocks[:,2:].unsqueeze(-1).div(shift, rounding_mode="trunc").bitwise_and(0x3).flatten(-2).cast(dtypes.float32)
+      return d * (q - 1)
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+
+def dequant_blocks(raw: Tensor, ggml_type: int, out_features: int, in_features: int, dtype=dtypes.float16) -> Tensor:
+  """
+  Dequantizes raw quantized blocks (as produced by `gguf_load(raw_types=...)`) into a dense
+  `(out_features, in_features)` tensor of the requested dtype. The dequantization is a lazy
+  op: when used inside a matmul, tinygrad's scheduler can fuse it so the dense weight is only
+  a transient, keeping the resident memory footprint at the compact quantized size.
+  """
+  nelements, nbytes = _GGML_QUANT[ggml_type]
+  if in_features % nelements != 0:
+    raise ValueError(f"dequant_blocks: in_features={in_features} not a multiple of block size {nelements} for type {ggml_type}")
+  # raw has shape (out_features, blocks_per_row, nbytes); flatten to a 1D byte tensor
+  flat = raw.reshape(-1)
+  dequant = ggml_data_to_tensor(flat, out_features * in_features, ggml_type).reshape(out_features, in_features)
+  return dequant.cast(dtype)
 
 def _read_unpack(fmt: str, n: int, r:io.BufferedIOBase): return struct.unpack(fmt, r.read(n))[0]
 def read_str(r:io.BufferedIOBase): return str(r.read(read_uint64(r)), "utf-8")
@@ -193,7 +215,9 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+RawQuant = tuple[Tensor, int, tuple[int, int]] # (raw uint8 blocks, ggml type, (out_features, in_features))
+
+def _gguf_parse(tensor: Tensor, raw_types: set[int]|None = None) -> tuple[dict, dict[str, Tensor|RawQuant]]:
   # TODO: remove the need for copy to default device
   tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -209,7 +233,21 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  state_dict: dict[str, Tensor|RawQuant] = {}
+  for name, dims, typ, off in t_infos:
+    n = prod(dims)
+    if raw_types is not None and typ in raw_types and typ in _GGML_QUANT:
+      nelements, nbytes = _GGML_QUANT[typ]
+      n_blocks = (n + nelements - 1) // nelements
+      # keep raw block bytes as uint8; store logical shape for later dequant
+      raw = tensor[data_start + off : data_start + off + n_blocks * nbytes].contiguous()
+      raw = raw.reshape((n_blocks, nbytes))
+      # store with logical shape encoded as attribute; reshape to (out, in, nbytes) when out*in==n
+      out_features, in_features = dims[-1], dims[0] if len(dims) > 1 else 1
+      blocks_per_row = (in_features + nelements - 1) // nelements
+      state_dict[name] = (raw.reshape((out_features, blocks_per_row, nbytes)), typ, (out_features, in_features))
+    else:
+      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -218,7 +256,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, raw_types: set[int]|None = None) -> tuple[dict, dict[str, Tensor|RawQuant]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -232,9 +270,14 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
+
+  When `raw_types` is provided, tensors whose GGML type is in the set are NOT dequantized.
+  Instead they are returned as a tuple `(raw_blocks_uint8, ggml_type, (out_features, in_features))`
+  where `raw_blocks_uint8` has shape `(out_features, blocks_per_row, block_nbytes)`. The caller
+  is responsible for on-demand dequantization. This keeps quantized weights compact in memory.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), raw_types=raw_types)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), raw_types=raw_types)[1])
   return kv, sd

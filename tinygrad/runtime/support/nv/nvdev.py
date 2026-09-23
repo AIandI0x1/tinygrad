@@ -106,7 +106,8 @@ class NVDev:
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
       if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
       self.pci_dev.reset()
-      time.sleep(0.1) # wait until device can respond again
+      # eGPU over Thunderbolt needs longer for the GPU to fully come back after reset
+      time.sleep(2.0) # wait until device can respond again
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
@@ -154,7 +155,7 @@ class NVDev:
     else:
       paddr = self.mm.palloc(sz, boot=False)
       view = self.vram.view(paddr, sz)
-      sysaddr = [self.pci_dev.bar_info(1)[0] + paddr + i * 0x1000 for i in range(sz // 0x1000)]
+      sysaddr = [paddr + i * 0x1000 for i in range(sz // 0x1000)]
     if data is not None: view[:size] = data
     return view, paddr, sysaddr
 

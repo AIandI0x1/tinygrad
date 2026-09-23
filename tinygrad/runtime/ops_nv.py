@@ -541,7 +541,12 @@ class PCIIface(PCIIfaceBase):
     self.gpfifo_class, self.compute_class, self.dma_class = (gsp:=self.dev_impl.gsp).gpfifo_class, gsp.compute_class, gsp.dma_class
     self.viddec_class = gsp.viddec_class
 
-  def setup_usermode(self): return 0xce000000, self.pci_dev.map_bar(bar=0, fmt='I', off=0xbb0000, size=0x10000)
+  def setup_usermode(self):
+    # exec_local remotes can't map the BAR into the host process: use a shadow page, forwarded by CPUProgram after each run
+    # the doorbell is a write-only strobe: always forward it even if the value is unchanged
+    if hasattr(self.pci_dev, 'shadow_mmio'): mmio = self.pci_dev.shadow_mmio(0, 0xbb0000, 0x10000, always_flush=True)
+    else: mmio = self.pci_dev.map_bar(bar=0, fmt='I', off=0xbb0000, size=0x10000)
+    return 0xce000000, mmio
   def setup_vm(self, vaspace): pass
   def setup_gpfifo_vm(self, gpfifo): pass
 
@@ -607,13 +612,18 @@ class NVDevice(Compiled):
 
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
 
+    # GPFIFO ring must be in VRAM (GSP firmware expects VRAM handles for hObjectBuffer/hUserdMemory);
+    # exec_local remotes use shadow MMIO for the barview so the CPU program can write locally.
+    # On small-bar devices the CPU can only reach the first BAR1 bytes of VRAM, so this has to be allocated eagerly:
+    # late allocations (e.g. after a big model alloc) can land past the window and their shadow writes get dropped.
+    mem = self.iface.alloc(3<<20, contiguous=True, cpu_access=True, force_devmem=True,
+                           map_flags=nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23)
+    self.gpfifo_buf = Buffer(self.device, 3<<20, dtypes.uint8, opaque=mem)
+
     self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
 
   @functools.cached_property
   def fifos(self) -> dict[str, GPFifo]:
-    mem = self.iface.alloc(3<<20, contiguous=True, cpu_access=True, force_devmem=True, map_flags=nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23)
-    self.gpfifo_buf = Buffer(self.device, 3<<20, dtypes.uint8, opaque=mem)
-
     compute = self._new_gpu_fifo("COMPUTE:0", self.ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
     copy = self._new_gpu_fifo("COPY:0", self.ctxshare, self.channel_group, offset=0x100000, entries=0x10000)
     self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
@@ -652,9 +662,13 @@ class NVDevice(Compiled):
     if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
 
     gpput_off = offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset
+    # every fifo needs its own doorbell shadow: tokens of queues submitted in one flush would otherwise collapse into a single strobe
+    has_shadows = hasattr(getattr(self.iface, 'pci_dev', None), 'shadow_mmio')
+    db_mmio = self.iface.pci_dev.shadow_mmio(0, 0xbb0090, 4, always_flush=True) if has_shadows else None
+    db_addr = db_mmio.addr if db_mmio is not None else self.gpu_mmio.addr + 0x90
     fifo = GPFifo(ring=self.gpfifo_buf.view(entries, dtypes.uint64, offset).ensure_allocated(),
       gpput=self.gpfifo_buf.view(1, dtypes.uint32, gpput_off).ensure_allocated(),
-      doorbell=Buffer("CPU", 1, dtypes.uint32, options=BufferSpec(external_ptr=self.gpu_mmio.addr + 0x90), preallocate=True),
+      doorbell=Buffer("CPU", 1, dtypes.uint32, options=BufferSpec(external_ptr=db_addr), preallocate=True),
       put_value=Buffer("CPU", 1, dtypes.uint64, initial_value=bytes(8)), notifier=notifier, entries=entries, token=ws_token_params.workSubmitToken)
     self.pm_bufferize = PatternMatcher([(UPat(Ops.PARAM, tag=to_name(n, name)), lambda ctx, b=getattr(fifo, n): b)
                                         for n in ("ring", "gpput", "doorbell", "put_value")]) + self.pm_bufferize

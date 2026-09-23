@@ -1,9 +1,10 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools, subprocess, time
 try: import fcntl # windows misses that
 except ImportError: fcntl = None #type:ignore[assignment]
+from typing import ClassVar
 from tinygrad.device import BufferStorage, Buffer, Device
-from tinygrad.helpers import round_up, getenv, OSX, temp, DEBUG, pluralize, DEV
+from tinygrad.helpers import round_up, getenv, OSX, temp, DEBUG, pluralize, ceildiv, mv_address, DEV
 from tinygrad.runtime.autogen import libc, pci, vfio
 from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, MMIOInterface
 from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
@@ -128,6 +129,7 @@ class _System:
   @functools.cache
   def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
     if getenv("REMOTE", ""): return [(functools.partial(RemotePCIDevice, sock=s), x) for s, x in RemotePCIDevice.scan(vendor, devices, base_class)]
+    if OSX: return [(APLRemotePCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
     return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
 
   def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
@@ -309,7 +311,8 @@ class PCIIfaceBase:
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
             **kwargs) -> BufferStorage:
-    should_use_sysmem = host or (cpu_access and self.is_bar_small() and not force_devmem)
+    # exec_local remotes have no BAR access from the host process: cpu_access buffers must live in shared sysmem
+    should_use_sysmem = host or (cpu_access and (self.is_bar_small() or getattr(self.remote, 'exec_local', False)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
@@ -321,7 +324,10 @@ class PCIIfaceBase:
       return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
 
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
-    barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
+    if cpu_access:
+      if getattr(self.remote, 'exec_local', False): barview = self.pci_dev.shadow_mmio(self.vram_bar, mapping.paddrs[0][0], mapping.size)
+      else: barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size)
+    else: barview = None
     return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), barview)
 
   def free(self, storage:BufferStorage):
@@ -335,7 +341,11 @@ class PCIIfaceBase:
 
   def map(self, b:Buffer) -> BufferStorage:
     if b.device.split(":")[0] in {"CPU", "PYTHON", "NPY"}:
-      if self.dev.host != Device[b.device].host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+      if self.dev.host != Device[b.device].host and not getattr(getattr(self.dev, 'remote', None), 'exec_local', False):
+        raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+      if self.dev.host != Device[b.device].host and getattr(getattr(self.dev, 'remote', None), 'exec_local', False):
+        # exec_local: CPU MMIO registers (e.g. doorbell) stay at their local address, no GPU mapping needed
+        return BufferStorage(b._buf)
       if b._buf % 0x1000: raise RuntimeError("Host mapping requires a page-aligned address")
       lo, size = b._buf, round_up(b.nbytes, 0x1000)
       if not self.dev_impl.mm.va_base <= lo < lo + size <= self.dev_impl.mm.va_base + (1 << self.dev_impl.mm.va_bits):
@@ -418,6 +428,7 @@ class RemotePCIDevice(PCIDevice):
   @staticmethod
   def _rpc(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b'',
            readout_size:int=0) -> tuple[int, int, bytes]:
+    if DEBUG >= 2: print(f"  remote rpc {cmd.name} {dev=} {bar=} {args=} {readout_size=}", flush=True)
     RemotePCIDevice._post(sock, cmd, *args, dev=dev, bar=bar, payload=payload)
     status, r0, r1 = struct.unpack(REMOTE_RESP, RemotePCIDevice._recvall(sock, struct.calcsize(REMOTE_RESP)))
     if status: raise RuntimeError(f"remote {cmd.name} failed: {RemotePCIDevice._recvall(sock, r0).decode()}")
@@ -450,3 +461,101 @@ class RemotePCIDevice(PCIDevice):
     return RemoteMMIOInterface(self, bar, host_va + off, size or (sz - off), fmt, off=off)
 
 if DEV.interface.startswith("MOCK"): from test.mockgpu.mockgpu import MockFileIOInterface as FileIOInterface  # noqa: F401 # pylint: disable=unused-import
+
+class APLRemotePCIDevice(RemotePCIDevice):
+  # macOS eGPU over Thunderbolt: PCI access through the TinyGPU.app DriverKit extension, unix socket transport.
+  APP_PATH = "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU"
+  PEER_GROUP = "remote:APL:0" # pairs the GPU with its "CPU:APL:0" host device on this machine
+  exec_local = True # the server runs on this host: CPU programs execute locally, buffers are fd-mapped shared memory
+
+  @staticmethod
+  @functools.cache
+  def _server_sock(sock_path:str) -> socket.socket:
+    # the TinyGPU server is single-client: all APL devices in this process share one connection
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for i in range(100):
+      try:
+        sock.connect(sock_path)
+        break
+      except (ConnectionRefusedError, FileNotFoundError):
+        if i == 0:
+          subprocess.Popen([APLRemotePCIDevice.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)
+    else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    return sock
+
+  def __init__(self, devpref:str, pcibus:str):
+    sock = self._server_sock(getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")))
+    self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, 0, None
+    self.peer_group, self.lock_fd = self.PEER_GROUP, System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+
+  # the server keeps sysmem in a fixed 128-slot table with no unmap command: carve small allocs out of large slabs
+  _sysmem_slabs:ClassVar[list] = [] # [view, paddrs, bump_offset], shared by all instances on the single-client server
+
+  def _alloc_sysmem_remote(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    self._post(self.sock, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), dev=self.dev_id)
+    msg, anc, _, _ = self.sock.recvmsg(struct.calcsize(REMOTE_RESP), socket.CMSG_LEN(4))
+    status, mapped_size, _ = struct.unpack(REMOTE_RESP, msg)
+    if status: raise RuntimeError(f"remote MAP_SYSMEM_FD failed: {self._recvall(self.sock, mapped_size).decode()}")
+    fd = struct.unpack('<i', anc[0][2][:4])[0]
+    view = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
+
+    # paddrs are stored as (paddr, size) pairs at the start of the mapping, terminated by (0, 0).
+    paddrs_raw = itertools.takewhile(lambda p: p[1] != 0, zip(view.view(fmt='Q')[0::2], view.view(fmt='Q')[1::2]))
+    return view, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    size, slab_sz = round_up(size, mmap.PAGESIZE), 64 << 20
+    if contiguous or size > slab_sz: return self._alloc_sysmem_remote(size, vaddr, contiguous)
+    for slab in self._sysmem_slabs:
+      if slab[2] + size <= slab[0].nbytes: break
+    else:
+      view, paddrs = self._alloc_sysmem_remote(slab_sz, 0, False)
+      slab = [view, paddrs, 0]
+      self._sysmem_slabs.append(slab)
+    off = slab[2]
+    slab[2] += size
+    return MMIOInterface(slab[0].addr + off, size, fmt='B'), slab[1][off // 0x1000:(off + size) // 0x1000]
+
+  def free_sysmem(self, view:MMIOInterface):
+    if any(s[0].addr <= view.addr < s[0].addr + s[0].nbytes for s in self._sysmem_slabs): return # slab-owned, reclaimed with the slab
+    with contextlib.suppress(OSError): FileIOInterface.munmap(view.addr, view.nbytes)
+    with contextlib.suppress(RuntimeError, ConnectionError): self.rpc(RemoteCmd.UNMAP_SYSMEM, view.addr, view.nbytes) # not in old servers
+  def cpu_view(self, addr:int, size:int) -> MMIOInterface: return MMIOInterface(addr, size, fmt='B') # same address space
+
+  # CPU-visible BAR writes can't be issued directly: host programs write into a local shadow page, which is then
+  # diffed and forwarded to the real registers over MMIO_WRITE by flush_shadows() after each locally-run program.
+  _shadows:ClassVar[list] = [] # shared by all instances on the single-client server
+
+  def shadow_mmio(self, bar:int, off:int, size:int, always_flush:bool=False) -> MMIOInterface:
+    mm = mmap.mmap(-1, sz := round_up(size, mmap.PAGESIZE))
+    self._shadows.append([memoryview(mm), bytearray(sz), bar, off, always_flush, -1]) # last written offset
+    return MMIOInterface(mv_address(mm), sz, fmt='B')
+
+  def flush_shadows(self):
+    # BAR1 (VRAM data: GPFIFO ring) must be flushed before BAR0 (doorbell) so the GPU sees the ring entry before being notified
+    if DEBUG >= 3: print(f"  flush_shadows called, {len(self._shadows)} shadows", flush=True)
+    for shadow in sorted(self._shadows, key=lambda s: -s[2]):
+      mv, prev, bar, off, always, last_off = shadow
+      cur = bytes(mv)
+      ch = [i for i in range(0, len(cur), 4) if cur[i:i + 4] != prev[i:i + 4]]
+      if not ch and always and last_off >= 0: ch = [last_off] # strobe: re-send the last written dword (e.g. doorbell)
+      if not ch: continue
+      groups: list[list[int]] = []
+      for i in ch:
+        if groups and i == groups[-1][0] + groups[-1][1]: groups[-1][1] += 4
+        else: groups.append([i, 4])
+      for goff, glen in groups:
+        # MMIO_WRITE has no response: fire-and-forget
+        if DEBUG >= 3: print(f"  apl shadow flush: bar={bar} off=0x{off+goff:x} len={glen} val={cur[goff:goff+glen].hex()}", flush=True)
+        self._post(self.sock, RemoteCmd.MMIO_WRITE, off + goff, glen, dev=self.dev_id, bar=bar, payload=cur[goff:goff + glen])
+      shadow[5] = ch[-1] # remember last written offset for strobe
+      prev[:] = cur
+
+  def resize_bar(self, bar_idx:int): pass # Thunderbolt enclosure fixes BAR sizes; old servers don't implement RESIZE_BAR
+
+  # old servers return only (paddr, size) for MAP_BAR, no host_va readout
+  @functools.cache
+  def _bar(self, bar:int) -> tuple[int, int, int]: return (*self.rpc(RemoteCmd.MAP_BAR, bar=bar)[:2], 0)
+  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
+    return RemoteMMIOInterface(self, bar, 0, size or (self._bar(bar)[1] - off), fmt, off=off)

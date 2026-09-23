@@ -1,9 +1,10 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
+from typing import Any
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, dequant_blocks
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -17,6 +18,45 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+
+def hadamard_rot(block_size:int, dtype=dtypes.float32) -> Tensor:
+  # normalized Sylvester-Walsh-Hadamard: H[r,c] = (-1)^popcount(r&c) / sqrt(block_size)
+  r, c = Tensor.arange(block_size).unsqueeze(1), Tensor.arange(block_size).unsqueeze(0)
+  p = (r & c).expand(block_size, block_size).contiguous()
+  for sh in (16, 8, 4, 2, 1): p = p ^ (p >> sh)
+  return ((p & 1) * -2 + 1).cast(dtype) * block_size**-0.5
+
+class _HadamardSpec: # __slots__ keeps rot/signs out of get_state_dict's __dict__ walk
+  __slots__ = ("rot", "signs", "perm")
+  def __init__(self, rot:Tensor, signs:Tensor|None, perm:tuple[int,int,int]|None=None):
+    self.rot, self.signs, self.perm = rot, signs, perm
+
+class HadamardLinear(Linear):
+  """Linear whose input gets the prism.hadamard activation transform: optional GDN feature regroup,
+  explicit sign flip, then the normalized blockwise Hadamard rotation."""
+  def __init__(self, lin:Linear, spec:_HadamardSpec):
+    self.weight, self.bias, self.in_features, self.out_features, self._spec = \
+      lin.weight, lin.bias, lin.in_features, lin.out_features, spec
+  def __call__(self, x:Tensor) -> Tensor:
+    if self._spec.perm is not None:
+      hd, nk, rep = self._spec.perm
+      # ggml dim0 is fastest-varying: arrival order [hd, nk, rep] is row-major (rep, nk, hd) here;
+      # regroup to the fold order [hd, rep, nk] = row-major (nk, rep, hd)
+      x = x.reshape(*x.shape[:-1], rep, nk, hd).transpose(-3, -2).reshape(x.shape)
+    if self._spec.signs is not None: x = x * self._spec.signs
+    n = self._spec.rot.shape[0]
+    x = (x.reshape(*x.shape[:-1], -1, n) @ self._spec.rot).reshape(x.shape)
+    return x.linear(self.weight.transpose(), self.bias)
+
+class HadamardEmbedding(nn.Embedding):
+  """Embedding whose rows are stored in the rotated basis: apply the inverse transform (rot then signs)
+  to each looked-up row instead of materializing the full primal table."""
+  def __init__(self, emb:nn.Embedding, spec:_HadamardSpec):
+    self.weight, self._spec = emb.weight, spec
+  def __call__(self, tokens:Tensor) -> Tensor:
+    x, n = super().__call__(tokens), self._spec.rot.shape[0]
+    assert self._spec.signs is not None
+    return ((x.reshape(*x.shape[:-1], -1, n) @ self._spec.rot).reshape(x.shape) * self._spec.signs).contiguous()
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -359,7 +399,7 @@ class Transformer:
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
                                if config.ssm and config.ssm_layers[i] else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
-    self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
+    self.token_embd: nn.Embedding|HadamardEmbedding = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
@@ -384,10 +424,22 @@ class Transformer:
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    # Load with raw_types to keep PQ2_0 (and other quantized) weights as compact uint8 blocks
+    # instead of eagerly dequantizing to float32. The blocks are dequantized lazily during
+    # matmul, keeping the resident memory footprint at the compact quantized size.
+    raw_types = {142} if getenv("PQ2_LAZY", 1) else None
+    kv, raw_sd = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, raw_types=raw_types)
 
-    # all state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    # convert raw block tuples to lazy dequant tensors (float16 by default)
+    half = getenv("HALF", 1)
+    target_dtype = dtypes.float16 if half else dtypes.float32
+    state_dict: dict[str, Tensor] = {}
+    for k, v in raw_sd.items():
+      if not isinstance(v, Tensor):
+        raw, typ, (out_f, in_f) = v
+        state_dict[k] = dequant_blocks(raw, typ, out_f, in_f, dtype=target_dtype)
+      else:
+        state_dict[k] = v.cast(target_dtype) if half else v
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -457,6 +509,42 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
+
+    # prism.hadamard: folded ternary weights store W' = (D_s @ H)^-1 @ W; each folded matmul must be fed
+    # blockwise(H @ (signs * x)) instead of x. Inverse-listed weights (the embedding table) store rotated
+    # rows and get s * (H @ z) applied to the primal lookup.
+    if kv.get('prism.hadamard.version') == 1:
+      bs = kv['prism.hadamard.block_size']
+      assert kv['prism.hadamard.transform'] == 'normalized-sylvester-walsh-hadamard' and kv['prism.hadamard.axis'] == 'input-last-dimension'
+      rot = hadamard_rot(bs, target_dtype)
+      sign_map: dict[int, Tensor] = {}
+      off = 0
+      for w in kv.get('prism.hadamard.sign_widths', []):
+        sign_map[w] = Tensor(kv['prism.hadamard.sign_values'][off:off+w], dtype=target_dtype)
+        off += w
+      for name in kv.get('prism.hadamard.inverse_weight_names', []):
+        if name == 'token_embd.weight':
+          assert isinstance(model.token_embd, nn.Embedding)
+          model.token_embd = HadamardEmbedding(model.token_embd, _HadamardSpec(rot, sign_map[config.dim]))
+        elif name in state_dict:
+          e, d = state_dict[name].contiguous().realize(), int(state_dict[name].shape[-1])
+          state_dict[name] = ((e.reshape(*e.shape[:-1], d//bs, bs) @ rot).reshape(e.shape) * sign_map[d]).contiguous().realize()
+      gdn_grouped = kv.get('prism.hadamard.gdn_v_grouped', False)
+      for name in kv['prism.hadamard.weight_names']:
+        parts = name.removesuffix('.weight').split('.')
+        obj: Any = model
+        parent = model
+        for p in parts:
+          parent = obj
+          obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+        assert isinstance(obj, Linear), f"prism.hadamard weight {name} is not a Linear"
+        perm = None
+        if gdn_grouped and name.endswith('.ssm_out.weight'):
+          assert ssm is not None
+          nv, nk = ssm.time_step_rank, ssm.group_count
+          perm = (obj.in_features // nv, nk, nv // nk)
+        setattr(parent, parts[-1], HadamardLinear(obj, _HadamardSpec(rot, sign_map[obj.in_features], perm)))
+
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
