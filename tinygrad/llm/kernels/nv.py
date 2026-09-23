@@ -193,6 +193,7 @@ class Linear(AMDLinear):
   """AMD custom-kernel Linear extended with an NV PQ2_0 gemv path."""
   _pq2_scales: Tensor
   _pq2_codes: Tensor
+  _pq2_raw: Tensor
   def __call__(self, x:Tensor) -> Tensor:
     if (out := nv_forward(self, x)) is not None: return out
     return super().__call__(x)

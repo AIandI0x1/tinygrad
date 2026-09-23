@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from typing import Any
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear_raw, pq2_forward
 from tinygrad.llm.gguf import gguf_load, dequant_blocks
@@ -518,11 +518,13 @@ class Transformer:
     if kv.get('prism.hadamard.version') == 1:
       bs = kv['prism.hadamard.block_size']
       assert kv['prism.hadamard.transform'] == 'normalized-sylvester-walsh-hadamard' and kv['prism.hadamard.axis'] == 'input-last-dimension'
-      rot = hadamard_rot(bs, target_dtype)
+      rot = hadamard_rot(bs, target_dtype).to(Device.DEFAULT).realize()
       sign_map: dict[int, Tensor] = {}
       off = 0
+      # realize signs on the compute device: PYTHON-side constants get copied into GPU-visible
+      # sysmem every token otherwise (~194 synced copies/token on the remote path)
       for w in kv.get('prism.hadamard.sign_widths', []):
-        sign_map[w] = Tensor(kv['prism.hadamard.sign_values'][off:off+w], dtype=target_dtype)
+        sign_map[w] = Tensor(kv['prism.hadamard.sign_values'][off:off+w], dtype=target_dtype).to(Device.DEFAULT).realize()
         off += w
       for name in kv.get('prism.hadamard.inverse_weight_names', []):
         if name == 'token_embd.weight':
