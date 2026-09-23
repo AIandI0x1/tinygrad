@@ -4,7 +4,7 @@ from typing import Any
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear, pq2_forward
+from tinygrad.llm.kernels.nv import Linear, tag_pq2_linear_raw, pq2_forward
 from tinygrad.llm.gguf import gguf_load, dequant_blocks
 from tinygrad.uop.ops import Ops, resolve
 
@@ -558,23 +558,17 @@ class Transformer:
       if p.nbytes() > dense_budget: break
       dense_budget -= p.nbytes()
       p.replace(p.contiguous().realize())
-    # tag the remaining lazy PQ2_0 linears for the NV fused gemv: repack raw blocks into
-    # aligned scale/code tensors (dense-realized weights keep their normal GEMM)
+    # tag every lazy PQ2_0 linear for the NV fused gemv: the kernel reads the packed 34B
+    # blocks directly (aligned u16 scale + assembled u32 codes), so tagging needs no extra
+    # device memory over the packed buffer the lazy path already reads
     if getenv("NV_PQ2_GEMV"):
-      # repack the biggest lazy PQ2 weights first, bounded by NV_PQ2_GEMV_GB: the card is ~12GB
-      # and repacked tensors + the rest of the model must fit; untagged weights stay lazy-dequant
-      tag_budget = int(getenv("NV_PQ2_GEMV_GB", 3) * (1 << 30))
-      candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
-                           if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')), reverse=True)
-      for nbytes, k, v in candidates:
-        if nbytes > tag_budget: continue
+      for k, v in raw_sd.items():
+        if isinstance(v, Tensor) or v[1] != 142 or not k.endswith('.weight'): continue
         obj = model
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         except (AttributeError, IndexError, TypeError): continue
-        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER:
-          tag_pq2_linear(obj, v[0], name=k)
-          tag_budget -= nbytes
+        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear_raw(obj, v[0], name=k)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

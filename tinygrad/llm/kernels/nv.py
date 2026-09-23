@@ -91,6 +91,63 @@ def f16_gemv(layer:AMDLinear, x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer.weight.reshape(-1), x, fxn=fxn)[0].reshape(out_shape)
   return result if layer.bias is None else result + layer.bias
 
+def _nv_pq2_gemv_raw_kernel(out:UOp, codes:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int, shuffle_fmt:str) -> UOp:
+  # warp-per-row on the *packed* 34B-block layout: u16 scale at block start, then 8 u32 code
+  # words at a 2-byte offset. words are assembled from two aligned u32 loads + parity select -
+  # no repack needed, so the raw weight buffer is the only device footprint.
+  nb = in_features // 128
+  assert nb * 128 == in_features and (nb * 34) % 4 == 0, f"in_features {in_features} gives unaligned row"
+  nwords, rowb32 = nb * 8, nb * 34 // 4
+  codes, x = codes.reshape((out_features, rowb32)), x.reshape((tokens, in_features))
+  token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
+  lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
+  acc = UOp.const(0, dtypes.float32)
+  per = nwords // WARP_SIZE
+  assert per * WARP_SIZE == nwords, f"{nwords} words not divisible by warp size"
+  for i in range(per):
+    wi = i*WARP_SIZE + lane
+    b, wsub = wi // 8, wi % 8
+    # scale: the fp16 u16 sits at byte offset 34b - grab it from the covering aligned u32
+    # (34b mod 4 is 0 or 2 -> shift 0 or 16, both branchless)
+    su32 = codes[out_row, (34*b) >> 2].load()
+    scale = ((su32 >> (8*(34*b & 3))) & 0xFFFF).cast(dtypes.uint16).bitcast(dtypes.float16).float()
+    # word: bytes [off, off+4) where off = 34b+2+4*wsub -> assemble from the covering aligned u32s.
+    # off mod 4 is 0 (odd block) or 2 (even block); select instead of an illegal <<32.
+    off, w32 = 34*b + 2 + 4*wsub, (34*b + 2 + 4*wsub) >> 2
+    rem = off & 3
+    w0 = codes[out_row, w32].load()
+    w1 = codes[out_row, w32 + 1].load()
+    word = rem.eq(0).where(w0, (w0 >> (8*rem)) | (w1 << (8*(4-rem))))
+    inner = UOp.const(0, dtypes.float32)
+    base = b*128 + wsub*16
+    for j in range(16):
+      code = (word >> (j*2)) & 0x3
+      xv = x[token, base+j].load()
+      inner = inner + (code.cast(dtypes.float32) - 1) * (xv.cast(dtypes.float32) if xv.dtype != dtypes.float32 else xv)
+    acc = acc + scale * inner
+  total = nv_warp_reduce(acc, shuffle_fmt)
+  return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="pq2_gemv", opts_to_apply=()))
+
+def pq2_gemv_raw(layer:'Linear', x:Tensor) -> Tensor:
+  out_shape, tokens = (*x.shape[:-1], layer.out_features), prod(x.shape[:-1])
+  assert isinstance(tokens, int)
+  x = x.contiguous().reshape(tokens, layer.in_features)
+  out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
+  fxn:Callable = functools.partial(_nv_pq2_gemv_raw_kernel, in_features=layer.in_features, out_features=layer.out_features,
+                                   tokens=tokens, shuffle_fmt=_shuffle_fmt(x.device))
+  result = Tensor.custom_kernel(out, layer._pq2_raw, x, fxn=fxn)[0].reshape(out_shape)
+  return result if layer.bias is None else result + layer.bias
+
+def tag_pq2_linear_raw(lin:'Linear', raw:Tensor, name:str="") -> None:
+  """Tag a lazy PQ2_0 linear to run the fused gemv directly on its packed 34B-block buffer:
+  uploads the raw bytes to the device once (u32 view) and drops the lazy weight - no repack."""
+  nb = lin.in_features // 128
+  if lin.in_features % 128 or (nb * 34) % 4 or (nb * 8) % WARP_SIZE: return
+  lin._pq2_raw = raw.reshape(lin.out_features, nb * 34).to(lin.weight.device).contiguous().bitcast(dtypes.uint32).realize()
+  lin.ggml_type = PQ2_0
+  if nv_custom_kernels_supported(lin.weight.device):
+    lin.weight = Tensor.zeros(1, dtype=dtypes.float16, device=lin.weight.device)
+
 def tag_pq2_linear(lin:'Linear', raw:Tensor, name:str="") -> None:
   """Repack a PQ2_0 raw-block weight into aligned (scales u16, codes u32) tensors and tag
   the Linear so __call__ routes to the fused gemv instead of the lazy-dequant matmul.
@@ -121,8 +178,9 @@ def nv_forward(lin:'Linear', x:Tensor) -> Tensor|None:
   """Dispatch decode matvecs to the custom NV kernels when the device supports them."""
   if not nv_custom_kernels_supported(lin.weight.device): return None
   if getattr(lin, 'ggml_type', None) == PQ2_0:
-    if isinstance(x.numel(), int): return pq2_gemv(lin, x)
-    return pq2_gemv(lin, x.pad_to(x.max_shape)).shrink(tuple((0, s) for s in (*x.shape[:-1], lin.out_features)))
+    gemv = pq2_gemv_raw if hasattr(lin, '_pq2_raw') else pq2_gemv
+    if isinstance(x.numel(), int): return gemv(lin, x)
+    return gemv(lin, x.pad_to(x.max_shape)).shrink(tuple((0, s) for s in (*x.shape[:-1], lin.out_features)))
   if lin.in_features % WARP_SIZE: return None
   w = lin.weight
   if w.uop.base.op is Ops.BUFFER and w.dtype == dtypes.float16 and isinstance(x.numel(), int) and x.numel() == lin.in_features:
