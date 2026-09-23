@@ -196,6 +196,12 @@ def main():
     exit(0)
 
   # interactive chat
+  # SIGINT sets a flag instead of raising: finish the in-flight token, then exit between
+  # tokens so the device can finalize cleanly (killing mid-command-buffer wedges remote GPUs)
+  stop = {"flag": False}
+  def _sigint(sig, frame): stop["flag"] = True
+  import signal
+  signal.signal(signal.SIGINT, _sigint)
   messages: list[dict] = []
   while 1:
     try: messages.append({"role":"user", "content":input('>>> ')})
@@ -203,12 +209,16 @@ def main():
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
     for next_id in model.generate(ids):
+      if stop["flag"]:
+        sys.stdout.write("\n(interrupted)\n\n")
+        break
       if tok.is_end(next_id):
         sys.stdout.write(dec() + "\n\n")
         break
       reply += (piece := dec(next_id))
       sys.stdout.write(piece)
       sys.stdout.flush()
+    if stop["flag"]: break
     messages.append({"role":"assistant", "content":reply})
 
 if __name__ == "__main__": main()
