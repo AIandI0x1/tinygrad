@@ -568,7 +568,8 @@ class Transformer:
       from tinygrad.device import GlobalCounters
       cap = int(getenv("NV_PQ2_VRAM_GB", 10.9) * (1 << 30))
       # smallest first: whole lazy-kernel families (e.g. the 8.3MB gate/out weights, ~110ms/token
-      # of fused dequant) get covered for ~1GB, while big weights cost 23MB+ each for the same saving
+      # of fused dequant) get covered for ~1GB, while big weights cost 23MB+ each for the same saving.
+      # upload transients inflate the counter, so also survive a hard OOM and keep going
       candidates = sorted(((v[0].nbytes(), k, v) for k, v in raw_sd.items()
                            if not isinstance(v, Tensor) and v[1] == 142 and k.endswith('.weight')))
       for nbytes, k, v in candidates:
@@ -577,7 +578,9 @@ class Transformer:
         try:
           for part in k[:-len('.weight')].split('.'): obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         except (AttributeError, IndexError, TypeError): continue
-        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER: tag_pq2_linear_raw(obj, v[0], name=k)
+        if isinstance(obj, Linear) and obj.weight.uop.base.op is not Ops.BUFFER:
+          try: tag_pq2_linear_raw(obj, v[0], name=k)
+          except MemoryError: pass
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
