@@ -434,10 +434,25 @@ class Transformer:
     # only the (T, D) activation crosses device boundaries, once per block
     for block in self.blk:
       if (d := getattr(block, '_dev', None)) is not None:
-        # remote NV has no host-write path for VRAM, so hops back to NV bounce through
-        # GPU-mapped sysmem (CPU:APL); hops to local devices go direct
-        x = x.to('CPU:APL', force=True).to(d, force=True) if d == Device.DEFAULT and x.device != 'CPU:APL' else x.to(d, force=True)
+        # a contiguous source lowers the hop to a bulk copy; METAL->NV has no host VRAM write
+        # path so it bounces through GPU-mapped sysmem (CPU:APL)
+        if x.device != d:
+          # materialize first: a view source would lower the hop to a strided kernel copy
+          # (cross-device INDEX) which the device assert rejects - contiguous gives a bulk copy
+          x = x.contiguous()
+          if d == Device.DEFAULT and x.device != 'CPU:APL':
+            dst = x.uop.empty_like(device='CPU:APL')
+            x = Tensor(dst.after(dst.store(x.uop)))   # bounce: NV->sysmem (GPU-mapped) first
+          dst = x.uop.empty_like(device=d)
+          x = Tensor(dst.after(dst.store(x.uop)))     # explicit store -> bulk copy exec item
       x = block(x, start_pos)
+    # tail hop: output_norm/output always run on the default device
+    if x.device != Device.DEFAULT:
+      x = x.contiguous()
+      dst = x.uop.empty_like(device='CPU:APL')
+      x = Tensor(dst.after(dst.store(x.uop)))
+      dst = x.uop.empty_like(device=Device.DEFAULT)
+      x = Tensor(dst.after(dst.store(x.uop)))
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
