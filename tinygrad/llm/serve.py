@@ -7,6 +7,10 @@ if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
 
+# set by the CLI's SIGINT/SIGTERM handlers: checked between tokens so generation
+# aborts at a realize boundary and the process exits with no GPU work in flight
+STOP = {"flag": False}
+
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
   if s.startswith("{"):  # hermes JSON format: {"name": ..., "arguments": {...}}
@@ -89,6 +93,7 @@ class Handler(VizHandler):
     try:
       yield chunk({"role":"assistant", "content":""})
       for next_id in model.generate(ids, temperature=temperature):
+        if STOP["flag"]: break
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break

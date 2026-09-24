@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
+import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time, threading
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
@@ -139,11 +139,11 @@ class FallbackTemplate:
 from tinygrad.llm.serve import LLMServer
 
 def main():
-  # SIGINT sets a flag instead of raising: in-flight GPU work drains, then we exit between
+  # SIGINT/SIGTERM set a flag instead of raising: in-flight GPU work drains, then we exit between
   # operations so the device can finalize cleanly (killing mid-command-buffer wedges remote GPUs)
   stop = {"flag": False}
   import signal
-  signal.signal(signal.SIGINT, lambda sig, frame: stop.__setitem__("flag", True))
+  for sig in (signal.SIGINT, signal.SIGTERM): signal.signal(sig, lambda sig, frame: stop.__setitem__("flag", True))
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
@@ -183,7 +183,15 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve:
+    from tinygrad.llm import serve as serve_mod
+    serve_mod.STOP = stop  # the signal handlers' flag also interrupts generation between tokens
+    srv = LLMServer(('', args.serve), model, model_name, tok, template)
+    def _watch():
+      while not stop["flag"]: time.sleep(0.2)
+      threading.Thread(target=srv.shutdown, daemon=True).start()
+    threading.Thread(target=_watch, daemon=True).start()
+    srv.serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
@@ -207,7 +215,7 @@ def main():
   stop = {"flag": False}
   def _sigint(sig, frame): stop["flag"] = True
   import signal
-  signal.signal(signal.SIGINT, _sigint)
+  for sig in (signal.SIGINT, signal.SIGTERM): signal.signal(sig, _sigint)
   messages: list[dict] = []
   while 1:
     try: messages.append({"role":"user", "content":input('>>> ')})
