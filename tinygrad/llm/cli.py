@@ -143,7 +143,10 @@ def main():
   # operations so the device can finalize cleanly (killing mid-command-buffer wedges remote GPUs)
   stop = {"flag": False}
   import signal
-  for sig in (signal.SIGINT, signal.SIGTERM): signal.signal(sig, lambda sig, frame: stop.__setitem__("flag", True))
+  def _set_stop(sig, frame):
+    print(f"signal {sig} received - draining in-flight GPU work, then exiting", file=sys.stderr)
+    stop["flag"] = True
+  for sig in (signal.SIGINT, signal.SIGTERM): signal.signal(sig, _set_stop)
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
@@ -186,6 +189,7 @@ def main():
   if args.serve:
     from tinygrad.llm import serve as serve_mod
     serve_mod.STOP = stop  # the signal handlers' flag also interrupts generation between tokens
+    if stop["flag"]: return  # a signal arrived during model load - exit without serving
     srv = LLMServer(('', args.serve), model, model_name, tok, template)
     def _watch():
       while not stop["flag"]: time.sleep(0.2)

@@ -64,9 +64,31 @@ def probe(timeout_s=5.0) -> bool:
   except (socket.timeout, ConnectionError, FileNotFoundError, struct.error): return False
   finally: sock.close()
 
+def try_device_reset() -> bool:
+  """Send RemoteCmd.RESET on the live server socket - if the dext maps it to a PCI
+  function-level reset this recovers a wedged card without a physical replug."""
+  try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    sock.connect(_server_sock_path())
+    sock.sendall(struct.pack("<BIIQQQ", 5, 0, 0, 0, 0, 0))  # RemoteCmd.RESET
+    sock.recv(17)
+    sock.close()
+    return True
+  except (socket.timeout, ConnectionError, FileNotFoundError, struct.error): return False
+
 def main():
   if "--check" in sys.argv:
     return 0 if probe() else 1
+  # first try a device reset while the server still owns the card - if it answers,
+  # an FLR can recover a wedge without touching sessions or hardware
+  if not probe():
+    print("probe failed - trying remote device reset before killing sessions...")
+    if try_device_reset():
+      time.sleep(3.0)
+      if probe():
+        print("device recovered via remote reset")
+        return 0
   kill_stale_clients()
   kill_server()
   time.sleep(1.0)
