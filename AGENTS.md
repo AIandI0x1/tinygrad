@@ -7,3 +7,6 @@
 - Do not do amend commits. Always do a new commit if a force push to origin would be required.
 - tinygrad has user space PCI drivers for AMD and NVIDIA GPUs. Do not insert the unneeded kernel modules.
 - Remote NV (macOS eGPU via TinyGPU): never kill a running NV process mid-flight (SIGKILL/SIGTERM during command-buffer execution wedges the GPU - it stops answering config reads and only a physical replug recovers it). The llm CLI exits cleanly on SIGINT between tokens. Run `python3 extra/nv_remote_reset.py` to clear soft wedges or confirm a hard wedge needs a replug.
+- Wedge severities: soft = stale client session on the single-client TinyGPU server (reset script fixes it). Hard = dead config reads (mailbox `ffffffff`) - needs a replug; killing the wedged dext (`org.tinygrad.tinygpu.driver2`) can hang IOKit/WindowServer and freeze the whole system - do NOT attempt a dext restart.
+- `NV_SKIP_FINI=1` skips the GSP unload RPC at process exit (wedge suspect). With it set, `init_hw` detects the parked GSP and unloads it safely before re-booting. The launchd wrapper `~/.local/bin/tiny3060-serve.sh` sets it.
+- The NV kernel compiler on macOS runs in docker (`ghcr.io/tinygrad/cuda-arm64`) - a cold-booted mac has no docker until `open -a Docker`; compile failures surface as BrokenPipeError in compile_server.
