@@ -186,6 +186,14 @@ class NV_FLCN(NV_IP):
   def init_hw(self):
     self.falcon, self.sec2 = 0x00110000, 0x00840000
 
+    # a parked GSP (NV_SKIP_FINI exit) must be unloaded before re-booting - doing it here is
+    # safe because nothing is in flight yet. On a wedged card config reads return 0xffffffff.
+    try:
+      parked = self.nvdev.pci_dev.read_config(0, 4) != 0xffffffff and \
+        self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.falcon).read_bitfields()['active_stat'] == 1
+      if parked: self.fini_hw()
+    except Exception: pass
+
     self.reset(self.falcon)
     self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
       imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,

@@ -53,14 +53,20 @@ def probe(timeout_s=5.0) -> bool:
   sock.settimeout(timeout_s)
   try:
     sock.connect(sock_path)
-    # PROBE vendor=0x10de base_class=3 (display): reply (n, bus:func) packed list
-    sock.sendall(struct.pack("<BIIQQQ", 0, 0, 0, 0x10de, 0, 3))
-    sock.recv(4)  # status + counts; a live device session answers quickly
+    # CFG_READ offset 0 (vendor/device id): requires the device to actually answer,
+    # unlike PROBE which can be served from cached state. 0xffffffff means wedged.
+    sock.sendall(struct.pack("<BIIQQQ", 3, 0, 0, 0, 4, 0))  # RemoteCmd.CFG_READ
+    resp = sock.recv(17)  # REMOTE_RESP <BQQ: status, r0, r1
+    if len(resp) >= 9:
+      status, r0 = resp[0], struct.unpack("<Q", resp[1:9])[0]
+      return status == 0 and r0 not in (0xffffffff, 0)
     return True
   except (socket.timeout, ConnectionError, FileNotFoundError, struct.error): return False
   finally: sock.close()
 
 def main():
+  if "--check" in sys.argv:
+    return 0 if probe() else 1
   kill_stale_clients()
   kill_server()
   time.sleep(1.0)
@@ -69,9 +75,7 @@ def main():
     return 0
   dpid, dcpu = dext_spin()
   if dpid is not None and dcpu > 50.0:
-    print(f"dext {dpid} is spinning at {dcpu:.0f}% CPU - the device is wedged below the driver; "
-          "killing processes won't help. Replug the eGPU (or reload the dext with admin).")
-    return 1
+    print(f"dext {dpid} is spinning at {dcpu:.0f}% CPU - the device is wedged below the driver")
   # server may not be running yet; try a fresh init in a subprocess (init polls
   # dead registers without a timeout, so it must not hang this script)
   print("no answer from server - attempting fresh init to respawn it...")
@@ -86,6 +90,8 @@ def main():
     print(f"hard wedge: {out.stderr.strip().splitlines()[-1] if out.stderr else 'no output'}")
   except subprocess.TimeoutExpired:
     print("hard wedge: init hung (60s timeout)")
+  # NOTE: killing the wedged dext is NOT safe - it can hang IOKit/WindowServer and
+  # freeze the whole system. A hard wedge really does need a physical replug.
   print("the GPU is not answering config reads - replug the eGPU (or reload the dext with admin)")
   return 1
 

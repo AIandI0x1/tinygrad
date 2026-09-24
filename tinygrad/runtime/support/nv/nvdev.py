@@ -86,7 +86,10 @@ class NVDev:
     for ip in [self.flcn, self.gsp]: ip.init_hw()
 
   def fini(self):
-    for ip in [self.gsp, self.flcn]: ip.fini_hw()
+    # remote eGPU: unloading GSP at process exit can wedge the card (dead config reads, replug
+    # needed). NV_SKIP_FINI keeps GSP parked so restarts are safe; the next init re-boots anyway.
+    if not getenv("NV_SKIP_FINI"):
+      for ip in [self.gsp, self.flcn]: ip.fini_hw()
 
   def reg(self, reg:str) -> NVReg: return self.__dict__[reg]
   def wreg(self, addr:int, value:int):
