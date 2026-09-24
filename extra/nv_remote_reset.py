@@ -90,6 +90,24 @@ def main():
     print(f"hard wedge: {out.stderr.strip().splitlines()[-1] if out.stderr else 'no output'}")
   except subprocess.TimeoutExpired:
     print("hard wedge: init hung (60s timeout)")
+  # try the remote RESET rpc: if the dext implements it as a function-level reset it
+  # recovers the card without a physical replug. Harmless if unsupported.
+  print("attempting remote device reset...")
+  try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    sock.connect(_server_sock_path())
+    sock.sendall(struct.pack("<BIIQQQ", 5, 0, 0, 0, 0, 0))  # RemoteCmd.RESET
+    sock.recv(17)
+    sock.close()
+    time.sleep(3.0)
+    out = subprocess.run([sys.executable, "-c",
+      "from tinygrad import Tensor; print((Tensor.ones(4,4,device='NV')@Tensor.ones(4,4,device='NV')).numpy()[0,0])"],
+      capture_output=True, text=True, timeout=60, env=env)
+    if "4.0" in out.stdout:
+      print("device recovered after remote reset")
+      return 0
+  except (socket.timeout, ConnectionError, FileNotFoundError, subprocess.TimeoutExpired): pass
   # NOTE: killing the wedged dext is NOT safe - it can hang IOKit/WindowServer and
   # freeze the whole system. A hard wedge really does need a physical replug.
   print("the GPU is not answering config reads - replug the eGPU (or reload the dext with admin)")

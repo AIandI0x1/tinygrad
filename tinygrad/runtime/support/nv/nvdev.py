@@ -86,8 +86,8 @@ class NVDev:
     for ip in [self.flcn, self.gsp]: ip.init_hw()
 
   def fini(self):
-    # remote eGPU: unloading GSP at process exit can wedge the card (dead config reads, replug
-    # needed). NV_SKIP_FINI keeps GSP parked so restarts are safe; the next init re-boots anyway.
+    # WARNING: NV_SKIP_FINI is UNSAFE on the remote eGPU - a parked GSP keeps host sysmem
+    # mappings that die with the process, and GSP touching freed memory wedges the card.
     if not getenv("NV_SKIP_FINI"):
       for ip in [self.gsp, self.flcn]: ip.fini_hw()
 
